@@ -12,6 +12,10 @@ docker compose -f docker-compose-test.yml build
 
 ```bash
 docker compose -f docker-compose-test.yml up
+
+# 后台启停
+docker compose -f docker-compose-test.yml up -d
+docker compose -f docker-compose-test.yml down
 ```
 
 
