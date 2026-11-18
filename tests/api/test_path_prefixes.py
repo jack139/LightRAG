@@ -15,6 +15,8 @@ from fastapi.testclient import TestClient
 import pytest
 
 
+pytestmark = pytest.mark.offline
+
 # Env vars that the project's `.env` may have populated (via load_dotenv at
 # import time of lightrag.api.config). Tests must be hermetic and not depend
 # on developer-local .env values, so we clear/override anything that affects
@@ -49,6 +51,10 @@ def _isolate_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("LLM_BINDING", "ollama")
     monkeypatch.setenv("EMBEDDING_BINDING", "ollama")
+    # Part of the minimal viable server config since create_app began
+    # refusing to start without a named embedding model. The ollama
+    # binding's own default, so no EMBEDDING_DIM is implied.
+    monkeypatch.setenv("EMBEDDING_MODEL", "bge-m3:latest")
 
 
 @pytest.fixture
@@ -517,8 +523,14 @@ class TestUvicornRootPathSemantics:
         }
         status = {"code": None}
 
+        request_received = False
+
         async def receive():
-            return {"type": "http.request", "body": b"", "more_body": False}
+            nonlocal request_received
+            if not request_received:
+                request_received = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            return {"type": "http.disconnect"}
 
         async def send(message):
             if message["type"] == "http.response.start":
@@ -541,6 +553,25 @@ class TestUvicornRootPathSemantics:
         finally:
             sys.argv = original_argv
 
+    def _build_app_with_staged_webui(self, prefix, tmp_path, monkeypatch):
+        """Build the app against a minimal staged WebUI build.
+
+        The /webui Mount only exists when the build is present (otherwise
+        /webui/ redirects to /docs), and the build is git-ignored, so CI has
+        none. Point the server module's ``__file__`` at ``tmp_path`` so both
+        the build check and the StaticFiles directory resolve to the stage.
+        """
+        webui_dir = tmp_path / "webui"
+        webui_dir.mkdir()
+        (webui_dir / "index.html").write_text(
+            "<!doctype html><title>stub</title>", encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            "lightrag.api.lightrag_server.__file__",
+            str(tmp_path / "lightrag_server.py"),
+        )
+        return self._build_app_with_prefix(prefix)
+
     @pytest.mark.asyncio
     async def test_route_strip_mode_matches(self):
         """Plain Route, proxy-strip mode: backend receives /openapi.json."""
@@ -561,7 +592,7 @@ class TestUvicornRootPathSemantics:
         assert status == 200
 
     @pytest.mark.asyncio
-    async def test_mount_strip_mode_matches(self):
+    async def test_mount_strip_mode_matches(self, tmp_path, monkeypatch):
         """WebUI Mount, proxy-strip mode: backend receives /webui/.
 
         This is the bug the middleware fixes. Without normalization,
@@ -571,12 +602,12 @@ class TestUvicornRootPathSemantics:
         /site01/webui/ before routing and the lookup resolves to
         index.html.
         """
-        app = self._build_app_with_prefix("/site01")
+        app = self._build_app_with_staged_webui("/site01", tmp_path, monkeypatch)
         status = await self._call_with_scope(app, "/webui/")
         assert status == 200
 
     @pytest.mark.asyncio
-    async def test_mount_verbatim_mode_matches(self):
+    async def test_mount_verbatim_mode_matches(self, tmp_path, monkeypatch):
         """WebUI Mount, verbatim mode: backend receives /site01/webui/.
 
         Already canonical; the middleware is a no-op for this case. The
@@ -584,7 +615,7 @@ class TestUvicornRootPathSemantics:
         strip — symmetric to test_route_verbatim_mode_matches but exercises
         the Mount path with its nested ``get_route_path`` resolution.
         """
-        app = self._build_app_with_prefix("/site01")
+        app = self._build_app_with_staged_webui("/site01", tmp_path, monkeypatch)
         status = await self._call_with_scope(app, "/site01/webui/")
         assert status == 200
 
@@ -642,14 +673,229 @@ class TestUvicornRootPathSemantics:
             "app-level root_path only — see TestUvicornRootPathSemantics docstring."
         )
 
-    def test_gunicorn_uses_upstream_uvicorn_worker(self):
+    def test_gunicorn_worker_does_not_inject_root_path(self):
         """Symmetric guard for the multi-worker launcher.
 
-        gunicorn_config.worker_class must remain the upstream
-        ``uvicorn.workers.UvicornWorker`` — a custom subclass injecting
-        root_path via CONFIG_KWARGS would re-introduce the same
-        path-doubling regression in worker processes.
+        The regression this protects against is a worker class that injects
+        ``root_path`` through ``CONFIG_KWARGS``, re-creating the path-doubling
+        in worker processes. Asserted as that invariant rather than as an exact
+        class name: the configured class IS a subclass now
+        (``LightRAGUvicornWorker`` adds the orphan check gunicorn's own workers
+        have and uvicorn's drops), and pinning the name would have blocked it
+        while proving nothing extra — a subclass could add root_path under any
+        name.
         """
-        from lightrag.api import gunicorn_config
+        from uvicorn_worker import UvicornWorker
 
-        assert gunicorn_config.worker_class == "uvicorn.workers.UvicornWorker"
+        from lightrag.api import gunicorn_config
+        from gunicorn.util import load_class
+
+        worker_class = load_class(gunicorn_config.worker_class)
+        assert issubclass(worker_class, UvicornWorker), worker_class
+        # Covers the subclass's own kwargs and everything it inherits.
+        assert "root_path" not in worker_class.CONFIG_KWARGS, (
+            "the gunicorn worker must not inject root_path; rely on FastAPI's "
+            "app-level root_path only — see TestUvicornRootPathSemantics docstring."
+        )
+
+
+class TestSwaggerUIAssetURLs:
+    """custom_swagger_ui_html must prefix its asset URLs with root_path.
+
+    TestRoutesAtNaturalPaths above only pins that /docs returns 200 — that
+    alone doesn't catch this bug, because the /docs route itself always
+    answers 200 regardless of root_path; it's the *asset URLs embedded in
+    its HTML* (swagger-ui-bundle.js, swagger-ui.css, favicon, the
+    oauth2-redirect link, and the openapi_url) that were previously emitted
+    as fixed absolute paths, 404ing behind a proxy that strips the prefix
+    before forwarding. Mirrors the root_path handling already covered for
+    service_info_response / workspace_unavailable_response /
+    redirect_to_default_ui.
+    """
+
+    def test_asset_urls_prefixed_with_api_prefix(self, mock_args_api_prefix):
+        with patch("lightrag.api.lightrag_server.LightRAG") as mock_rag:
+            mock_rag.return_value = MagicMock()
+            from lightrag.api.lightrag_server import create_app
+
+            app = create_app(mock_args_api_prefix)
+            client = TestClient(app)
+
+            response = client.get("/test-api/docs")
+            assert response.status_code == 200
+            html = response.text
+
+            assert 'src="/test-api/static/swagger-ui/swagger-ui-bundle.js"' in html
+            assert 'href="/test-api/static/swagger-ui/swagger-ui.css"' in html
+            assert 'href="/test-api/static/swagger-ui/favicon-32x32.png"' in html
+            assert "'/test-api/docs/oauth2-redirect'" in html
+            assert "'/test-api/openapi.json'" in html
+
+            # The un-prefixed form must not appear — that's exactly what
+            # 404s behind a proxy that strips /test-api before forwarding.
+            assert 'src="/static/swagger-ui/swagger-ui-bundle.js"' not in html
+
+    def test_asset_urls_unprefixed_without_api_prefix(self, mock_args_no_prefix):
+        with patch("lightrag.api.lightrag_server.LightRAG") as mock_rag:
+            mock_rag.return_value = MagicMock()
+            from lightrag.api.lightrag_server import create_app
+
+            app = create_app(mock_args_no_prefix)
+            client = TestClient(app)
+
+            response = client.get("/docs")
+            assert response.status_code == 200
+            html = response.text
+
+            assert 'src="/static/swagger-ui/swagger-ui-bundle.js"' in html
+            assert 'href="/static/swagger-ui/swagger-ui.css"' in html
+            assert 'href="/static/swagger-ui/favicon-32x32.png"' in html
+            assert "'/docs/oauth2-redirect'" in html
+            assert "'/openapi.json'" in html
+
+    def test_redoc_link_in_description_prefixed_with_api_prefix(
+        self, mock_args_api_prefix
+    ):
+        """The [View ReDoc documentation](...) link in the OpenAPI info
+        description (rendered in the Swagger UI info panel) must also carry
+        root_path -- raised in review on PR #3864: this link was still
+        hardcoded to /redoc even after the asset-URL fix, so it 404s behind
+        a proxy the same way the assets did."""
+        with patch("lightrag.api.lightrag_server.LightRAG") as mock_rag:
+            mock_rag.return_value = MagicMock()
+            from lightrag.api.lightrag_server import create_app
+
+            app = create_app(mock_args_api_prefix)
+            client = TestClient(app)
+
+            response = client.get("/test-api/openapi.json")
+            assert response.status_code == 200
+            description = response.json()["info"]["description"]
+
+            assert "[View ReDoc documentation](/test-api/redoc)" in description
+            assert "(/redoc)" not in description
+
+    def test_redoc_link_in_description_unprefixed_without_api_prefix(
+        self, mock_args_no_prefix
+    ):
+        with patch("lightrag.api.lightrag_server.LightRAG") as mock_rag:
+            mock_rag.return_value = MagicMock()
+            from lightrag.api.lightrag_server import create_app
+
+            app = create_app(mock_args_no_prefix)
+            client = TestClient(app)
+
+            response = client.get("/openapi.json")
+            assert response.status_code == 200
+            description = response.json()["info"]["description"]
+
+            assert "[View ReDoc documentation](/redoc)" in description
+
+
+class TestWhitelistUnderApiPrefix:
+    """WHITELIST_PATHS is matched against route paths, on the real application.
+
+    The unit-level matrix lives in tests/api/auth/test_whitelist_path_prefix.py;
+    these two cases pin the same contract on the app ``create_app`` actually
+    builds, because that is where the mount prefix, the normalizing middleware and
+    the routers' own auth dependency all come together.
+    """
+
+    @pytest.fixture(params=[False, True], ids=["api-key-only", "password-and-api-key"])
+    def _default_whitelist(self, monkeypatch, request):
+        """Pin the shipped whitelist and both auth modes, independent of .env.
+
+        Auth state is cached at import time; patch the cached value as well.
+        Return the missing-credentials status for the selected auth mode.
+        """
+        original_argv = sys.argv.copy()
+        try:
+            # config resolves its args on first attribute access; importing under
+            # pytest's own argv would argparse it and exit.
+            sys.argv = [sys.argv[0]]
+            from lightrag.api import utils_api
+        finally:
+            sys.argv = original_argv
+
+        monkeypatch.setattr(
+            utils_api, "whitelist_patterns", [("/health", False), ("/api", True)]
+        )
+        monkeypatch.setattr(utils_api, "auth_configured", request.param)
+        return 401 if request.param else 403
+
+    @staticmethod
+    def _args_with_prefix(prefix: str):
+        from lightrag.api.config import parse_args
+
+        original_argv = sys.argv.copy()
+        try:
+            sys.argv = [
+                "lightrag-server",
+                "--api-prefix",
+                prefix,
+                "--key",
+                "test-api-key",
+            ]
+            return parse_args()
+        finally:
+            sys.argv = original_argv
+
+    @pytest.fixture
+    def _colliding_prefix_args(self):
+        """An api_prefix that collides with the default whitelist's /api entry —
+        the value the project's own --help suggests."""
+        return self._args_with_prefix("/api/v1")
+
+    @pytest.fixture
+    def _noncolliding_prefix_args(self):
+        """The prefix style the multi-site docs use. Nothing here collides with
+        the whitelist, so this is where the *under*-exemption showed: no entry
+        matched and the exempt routes started demanding credentials."""
+        return self._args_with_prefix("/site01")
+
+    @pytest.mark.parametrize("mode", ["verbatim", "strip"])
+    def test_destructive_route_requires_auth_under_a_colliding_prefix(
+        self, _colliding_prefix_args, _default_whitelist, mode
+    ):
+        """DELETE /documents answered 200 unauthenticated before this fix, in
+        both forwarding modes."""
+        with patch("lightrag.api.lightrag_server.LightRAG") as mock_rag:
+            mock_rag.return_value = MagicMock()
+            from lightrag.api.lightrag_server import create_app
+
+            client = TestClient(create_app(_colliding_prefix_args))
+            prefix = "" if mode == "strip" else "/api/v1"
+
+            assert (
+                client.delete(f"{prefix}/documents").status_code == _default_whitelist
+            )
+
+    @pytest.mark.parametrize("mode", ["verbatim", "strip"])
+    def test_whitelisted_routes_stay_open_under_a_prefix(
+        self, _noncolliding_prefix_args, _default_whitelist, mode
+    ):
+        """/health must keep answering liveness probes (#3294) and the
+        Ollama-compatible routes must keep their documented exemption.
+
+        Both answered 401 under this prefix before the fix. The assertion is
+        "neither 401 nor 403" rather than 200 because these handlers reach into a
+        LightRAG that is only a MagicMock here: /health reads shared storage that
+        no test initializes, and /api/tags feeds mock attributes to a Pydantic
+        response model. Both therefore fail *after* the auth gate, which is why
+        server exceptions are surfaced as responses rather than raised. Getting
+        past the dependency at all is the property under test; the unit-level
+        matrix pins the exact 200.
+        """
+        with patch("lightrag.api.lightrag_server.LightRAG") as mock_rag:
+            mock_rag.return_value = MagicMock()
+            from lightrag.api.lightrag_server import create_app
+
+            client = TestClient(
+                create_app(_noncolliding_prefix_args), raise_server_exceptions=False
+            )
+            prefix = "" if mode == "strip" else "/site01"
+
+            assert client.get(f"{prefix}/health").status_code not in (401, 403)
+            # GET, matching the real registration; GET /api/chat would be a 405
+            # from the router without the dependency ever running.
+            assert client.get(f"{prefix}/api/tags").status_code not in (401, 403)

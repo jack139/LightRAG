@@ -10,15 +10,23 @@ in each engine's own ``cache.py``.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from lightrag.constants import PARSED_DIR_SUFFIX
+from lightrag.constants import (
+    DEFAULT_PARSER_RESULT_BUNDLE_DOWNLOAD_MAX_BYTES,
+    DEFAULT_PARSER_RESULT_BUNDLE_DOWNLOAD_TIMEOUT,
+    PARSED_DIR_SUFFIX,
+)
 from lightrag.utils import logger
+
+if TYPE_CHECKING:
+    import httpx
 
 
 def compute_size_and_hash(path: Path) -> tuple[int, str]:
@@ -102,20 +110,47 @@ def env_json(name: str, default: Any) -> Any:
         return default
 
 
-def response_error_detail(resp: Any, *, limit: int = 1000) -> str:
-    """Return a compact response body snippet for HTTP error reporting."""
-    try:
-        payload = resp.json() if getattr(resp, "text", "") else None
-    except Exception:
-        payload = None
+def response_error_detail(
+    resp: Any, *, body: bytes | None = None, limit: int = 1000
+) -> str:
+    """Return a compact response body snippet for HTTP error reporting.
 
-    if payload is not None:
+    ``body``, when provided, is used *instead of* ``resp.text`` /
+    ``resp.json()`` / ``resp.content`` -- none of those are touched at
+    all in that case. A response read via :func:`stream_capped_get`'s
+    manual ``response.aiter_bytes()`` loop (rather than ``resp.aread()``)
+    is never marked read in a way httpx accepts for those properties;
+    accessing any of them raises ``httpx.ResponseNotRead``, which is
+    itself a ``RuntimeError`` subclass (via ``httpx.StreamError``) and so
+    would silently masquerade as this function's own intended error
+    instead of surfacing the real HTTP status and detail. Callers that
+    already collected the body via streaming must pass it here.
+    """
+    if body is not None:
         try:
-            detail = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        except TypeError:
-            detail = repr(payload)
+            payload = json.loads(body) if body else None
+        except Exception:
+            payload = None
+        if payload is not None:
+            try:
+                detail = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            except TypeError:
+                detail = repr(payload)
+        else:
+            detail = body.decode("utf-8", errors="replace").strip()
     else:
-        detail = str(getattr(resp, "text", "") or "").strip()
+        try:
+            payload = resp.json() if getattr(resp, "text", "") else None
+        except Exception:
+            payload = None
+
+        if payload is not None:
+            try:
+                detail = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            except TypeError:
+                detail = repr(payload)
+        else:
+            detail = str(getattr(resp, "text", "") or "").strip()
 
     detail = " ".join(detail.split())
     if not detail:
@@ -125,28 +160,157 @@ def response_error_detail(resp: Any, *, limit: int = 1000) -> str:
     return detail
 
 
-def raise_for_status_with_detail(resp: Any, operation: str) -> None:
+def download_deadline_seconds() -> float | None:
+    """Live-read the overall result-bundle download wall-clock budget.
+
+    Read at call time (like :func:`result_bundle_limits`) so an operator
+    can raise or disable it without a code change. A non-positive value
+    disables the deadline (``None``), matching the zip-bomb guards'
+    "non-positive = unlimited" convention. Parsed as a float, not through
+    ``env_int`` — this value feeds straight into :func:`download_timeout`,
+    which takes fractional seconds natively, and mirrors the float style
+    ``httpx.Timeout(120.0, connect=30.0)`` already uses for the per-read
+    timeout it complements.
+    """
+    raw = os.getenv("PARSER_RESULT_BUNDLE_DOWNLOAD_TIMEOUT", "").strip()
+    if not raw:
+        seconds = float(DEFAULT_PARSER_RESULT_BUNDLE_DOWNLOAD_TIMEOUT)
+    else:
+        try:
+            seconds = float(raw)
+        except ValueError:
+            logger.warning(
+                "[external_parser] PARSER_RESULT_BUNDLE_DOWNLOAD_TIMEOUT=%r "
+                "is not a number; using %s",
+                raw,
+                DEFAULT_PARSER_RESULT_BUNDLE_DOWNLOAD_TIMEOUT,
+            )
+            seconds = float(DEFAULT_PARSER_RESULT_BUNDLE_DOWNLOAD_TIMEOUT)
+    return seconds if seconds > 0 else None
+
+
+def download_max_bytes() -> int | None:
+    """Live-read the streaming cap on a result-bundle download's response body.
+
+    Bounds the accepted response-body bytes received, checked chunk-by-chunk
+    by :func:`stream_capped_get`. Separate from
+    ``PARSER_RESULT_BUNDLE_MAX_TOTAL_BYTES`` (see :func:`result_bundle_limits`),
+    which bounds the *uncompressed* size a zip's central directory declares.
+    Non-positive disables the cap, same convention as this module's other
+    env-driven limits.
+    """
+    raw = env_int(
+        "PARSER_RESULT_BUNDLE_DOWNLOAD_MAX_BYTES",
+        DEFAULT_PARSER_RESULT_BUNDLE_DOWNLOAD_MAX_BYTES,
+    )
+    return raw if raw > 0 else None
+
+
+def download_timeout(seconds: float | None) -> asyncio.Timeout:
+    """Wall-clock timeout context manager for a download call.
+
+    A thin wrapper over ``asyncio.timeout()``, kept so every download call
+    site shares one entry point. Its own deadline raises
+    ``asyncio.TimeoutError`` (the builtin ``TimeoutError``), distinct from an
+    unrelated external cancellation, which still propagates as
+    ``CancelledError``.
+    """
+    return asyncio.timeout(seconds)
+
+
+async def stream_capped_get(
+    client: "httpx.AsyncClient", url: str, *, max_bytes: int | None, operation: str
+) -> tuple["httpx.Response", bytes]:
+    """GET ``url`` via streaming, rejecting once more than ``max_bytes`` of
+    body have been received.
+
+    A plain ``client.get(url)`` fully buffers the response into memory
+    before returning, no matter its size — a compromised or misbehaving
+    endpoint can hold arbitrarily large data in memory before any
+    zip-level check (entry count, declared uncompressed size) ever runs.
+    Checking the running total on every chunk means an oversized response
+    is rejected mid-download instead of after being fully buffered.
+    ``max_bytes=None`` disables the cap (reads the full body, same as
+    ``client.get()``).
+
+    Returns ``(response, body)`` rather than relying on
+    ``response.content`` / ``response.text`` — accessing either on a
+    streamed response before the body has been read raises httpx's
+    ``ResponseNotRead``, so callers that need the body must use the
+    returned ``body`` instead.
+
+    ``operation`` labels the error message instead of ``url`` itself: a
+    MinerU official-mode ``full_zip_url`` is a cloud-storage link that may
+    carry a signed access token in its query string, and this error can
+    end up persisted into ``doc_status.error_msg`` or logs.
+
+    Requests ``Accept-Encoding: identity`` and rejects any response whose
+    ``Content-Encoding`` is not absent/``identity``, checked right after
+    the response headers arrive and before any body byte is read.
+    Content-decoding would hand back decoded bytes instead of what was
+    received, letting a compressed body expand past ``max_bytes`` in
+    memory before the count catches up; rejecting any encoding keeps the
+    byte count accurate and avoids that amplification.
+    """
+    async with client.stream(
+        "GET", url, headers={"Accept-Encoding": "identity"}
+    ) as response:
+        content_encoding = response.headers.get("content-encoding")
+        if (
+            content_encoding is not None
+            and content_encoding.strip().lower() != "identity"
+        ):
+            raise RuntimeError(
+                f"{operation}: refusing response with Content-Encoding "
+                f"{content_encoding!r}; only an absent header or "
+                f"'identity' is accepted so the download's byte cap "
+                f"measures the accepted response-body bytes"
+            )
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in response.aiter_bytes():
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise RuntimeError(
+                    f"{operation}: response body exceeds {max_bytes} bytes; "
+                    f"refusing to buffer further"
+                )
+            chunks.append(chunk)
+        return response, b"".join(chunks)
+
+
+def raise_for_status_with_detail(
+    resp: Any, operation: str, *, body: bytes | None = None
+) -> None:
     """Raise an HTTP error that preserves service-provided response details.
 
     Treats any non-2xx response as an error, matching httpx's
     ``raise_for_status`` status handling (which also raises on 1xx/3xx,
     not just 4xx/5xx) while attaching a compact response-body snippet to
     the message for faster diagnosis.
+
+    ``body``: pass the bytes already collected via :func:`stream_capped_get`
+    when ``resp`` came from a streamed request. See
+    :func:`response_error_detail` for why this matters.
     """
     status_code = int(getattr(resp, "status_code", 0) or 0)
     if 200 <= status_code < 300:
         return
-    detail = response_error_detail(resp)
+    detail = response_error_detail(resp, body=body)
     raise RuntimeError(f"{operation} failed: HTTP {status_code} {detail}")
 
 
 __all__ = [
     "clear_dir_contents",
     "compute_size_and_hash",
+    "download_deadline_seconds",
+    "download_max_bytes",
+    "download_timeout",
     "env_bool",
     "env_int",
     "env_json",
     "raise_for_status_with_detail",
     "raw_dir_for_parsed_dir",
     "response_error_detail",
+    "stream_capped_get",
 ]

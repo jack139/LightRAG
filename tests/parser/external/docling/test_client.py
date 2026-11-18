@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from urllib.parse import quote
 
 import pytest
 
+from lightrag.parser.external.docling import client as client_mod
 from lightrag.parser.external.docling.client import (
     CONVERT_PATH,
     POLL_PATH,
@@ -32,6 +34,8 @@ from lightrag.parser.external.docling.client import (
     DoclingRawClient,
 )
 
+
+pytestmark = pytest.mark.offline
 
 # ---------------------------------------------------------------------------
 # Minimal httpx fake (no MockTransport — avoids the multipart encode path)
@@ -73,6 +77,8 @@ class _Recorder:
         poll_text: str | None = None,
         result_status_code: int = 200,
         result_text: str | None = None,
+        result_content: bytes | None = None,
+        result_content_type: str = "application/zip",
     ) -> None:
         self.terminal_status = terminal_status
         self.zip_bytes = zip_bytes
@@ -83,6 +89,8 @@ class _Recorder:
         self.poll_text = poll_text
         self.result_status_code = result_status_code
         self.result_text = result_text
+        self.result_content = result_content
+        self.result_content_type = result_content_type
 
         self.post_calls: list[dict] = []
         self.get_calls: list[dict] = []
@@ -90,6 +98,49 @@ class _Recorder:
 
 
 _CURRENT: dict[str, _Recorder] = {}
+
+
+class _FakeStreamContext:
+    """Async context manager mirroring ``httpx.AsyncClient.stream()``.
+
+    Yields a response-like object exposing ``.aiter_bytes()`` so the
+    production stream_capped_get helper can iterate it exactly like a real
+    streamed httpx response.
+    """
+
+    def __init__(self, response: "_FakeStreamResponse") -> None:
+        self._response = response
+
+    async def __aenter__(self) -> "_FakeStreamResponse":
+        return self._response
+
+    async def __aexit__(self, *_: Any) -> None:
+        pass
+
+
+class _FakeStreamResponse:
+    def __init__(
+        self,
+        *,
+        status_code: int = 200,
+        text: str = "",
+        content: bytes = b"",
+        headers: dict[str, str] | None = None,
+        chunk_size: int = 1 << 16,
+    ) -> None:
+        self.status_code = status_code
+        self.text = text
+        self.content = content or text.encode("utf-8")
+        self.headers = headers or {}
+        self._chunk_size = chunk_size
+
+    def json(self) -> Any:
+        return json.loads(self.text) if self.text else {}
+
+    async def aiter_bytes(self):
+        data = self.content
+        for i in range(0, len(data), self._chunk_size):
+            yield data[i : i + self._chunk_size]
 
 
 class _FakeAsyncClient:
@@ -156,19 +207,28 @@ class _FakeAsyncClient:
             if recorder.terminal_status != "success":
                 payload["error_message"] = "synthetic-failure"
             return _FakeResponse(status_code=200, text=json_dump(payload))
-        if RESULT_PATH.format(task_id=encoded) in url:
+        raise AssertionError(f"unexpected GET {url}")
+
+    def stream(self, method: str, url: str, **_: Any) -> "_FakeStreamContext":
+        recorder = _CURRENT["recorder"]
+        encoded = quote(recorder.task_id, safe="")
+        if method == "GET" and RESULT_PATH.format(task_id=encoded) in url:
             recorder.result_calls += 1
             if recorder.result_status_code != 200:
-                return _FakeResponse(
-                    status_code=recorder.result_status_code,
-                    text=recorder.result_text or "",
+                return _FakeStreamContext(
+                    _FakeStreamResponse(
+                        status_code=recorder.result_status_code,
+                        text=recorder.result_text or "",
+                    )
                 )
-            return _FakeResponse(
-                status_code=200,
-                content=recorder.zip_bytes,
-                headers={"content-type": "application/zip"},
+            return _FakeStreamContext(
+                _FakeStreamResponse(
+                    status_code=200,
+                    content=recorder.result_content or recorder.zip_bytes,
+                    headers={"content-type": recorder.result_content_type},
+                )
             )
-        raise AssertionError(f"unexpected GET {url}")
+        raise AssertionError(f"unexpected stream {method} {url}")
 
 
 def json_dump(payload: Any) -> str:
@@ -227,6 +287,10 @@ def source_pdf(tmp_path: Path) -> Path:
 
 @pytest.fixture(autouse=True)
 def docling_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    from lightrag.parser.external.docling import client as client_mod
+
+    client_mod._vlm_ignored_warned.clear()
+    client_mod._vlm_preset_ignored_warned = False
     monkeypatch.setenv("DOCLING_ENDPOINT", "http://docling.test")
     for name in (
         "DOCLING_DO_OCR",
@@ -236,6 +300,8 @@ def docling_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
         "DOCLING_OCR_LANG",
         "DOCLING_DO_FORMULA_ENRICHMENT",
         "DOCLING_ENGINE_VERSION",
+        "DOCLING_PIPELINE",
+        "DOCLING_VLM_PRESET",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -282,6 +348,276 @@ async def test_docling_client_sends_fixed_constants(
     assert manifest.engine == "docling"
     assert manifest.extras["fixed_constants"]["pipeline"] == "standard"
     assert manifest.endpoint_signature == "http://docling.test"
+
+
+async def test_docling_client_vlm_pipeline_sends_preset_and_omits_ocr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    source_pdf: Path,
+) -> None:
+    monkeypatch.setenv("DOCLING_PIPELINE", "vlm")
+    monkeypatch.setenv("DOCLING_VLM_PRESET", "minicpm_ocr")
+    recorder = _Recorder(
+        terminal_status="success",
+        zip_bytes=_fake_zip_with_main_json("demo"),
+    )
+    _CURRENT["recorder"] = recorder
+    _install_fake_httpx(monkeypatch)
+
+    raw_dir = tmp_path / "demo.docling_raw"
+    manifest = await DoclingRawClient().download_into(raw_dir, source_pdf)
+
+    field_map: dict[str, list[str]] = {}
+    for name, value in _form_pairs(recorder.post_calls[0]["data"]):
+        field_map.setdefault(name, []).append(value)
+
+    assert field_map["pipeline"] == ["vlm"]
+    assert field_map["vlm_pipeline_preset"] == ["minicpm_ocr"]
+    assert sorted(field_map["to_formats"]) == ["json", "md"]
+    for name in (
+        "do_ocr",
+        "force_ocr",
+        "ocr_engine",
+        "ocr_preset",
+        "ocr_lang",
+        "do_formula_enrichment",
+    ):
+        assert name not in field_map
+
+    assert manifest.extras["fixed_constants"]["pipeline"] == "vlm"
+
+
+async def test_docling_client_rejects_unknown_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DOCLING_PIPELINE", "fast")
+    with pytest.raises(ValueError, match="DOCLING_PIPELINE"):
+        DoclingRawClient()
+
+
+async def test_docling_client_vlm_requires_a_preset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DOCLING_PIPELINE", "vlm")
+    with pytest.raises(ValueError, match="DOCLING_VLM_PRESET"):
+        DoclingRawClient()
+
+
+async def test_docling_client_vlm_does_not_warn_for_default_ocr_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("DOCLING_PIPELINE", "vlm")
+    monkeypatch.setenv("DOCLING_VLM_PRESET", "minicpm_ocr")
+    # env.example ships these uncommented; they equal the defaults.
+    monkeypatch.setenv("DOCLING_DO_OCR", "true")
+    monkeypatch.setenv("DOCLING_FORCE_OCR", "true")
+    monkeypatch.setenv("DOCLING_DO_FORMULA_ENRICHMENT", "false")
+
+    with caplog.at_level("WARNING"):
+        DoclingRawClient()
+
+    assert not [r for r in caplog.records if "ignores" in r.getMessage()]
+
+
+async def test_docling_client_vlm_warns_once_for_changed_ocr_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("DOCLING_PIPELINE", "vlm")
+    monkeypatch.setenv("DOCLING_VLM_PRESET", "minicpm_ocr")
+    monkeypatch.setenv("DOCLING_OCR_ENGINE", "easyocr")
+    monkeypatch.setenv("DOCLING_DO_FORMULA_ENRICHMENT", "true")
+
+    with caplog.at_level("WARNING"):
+        DoclingRawClient()
+        DoclingRawClient()
+
+    warnings = [r.getMessage() for r in caplog.records if "ignores" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "DOCLING_OCR_ENGINE" in warnings[0]
+    assert "DOCLING_DO_FORMULA_ENRICHMENT" in warnings[0]
+    assert "DOCLING_DO_OCR" not in warnings[0]
+
+
+async def test_docling_client_vlm_task_failure_names_the_preset_requirement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    source_pdf: Path,
+) -> None:
+    monkeypatch.setenv("DOCLING_PIPELINE", "vlm")
+    monkeypatch.setenv("DOCLING_VLM_PRESET", "minicpm_ocr")
+    recorder = _Recorder(
+        terminal_status="failure",
+        zip_bytes=_fake_zip_with_main_json("demo"),
+    )
+    _CURRENT["recorder"] = recorder
+    _install_fake_httpx(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="DOCLING_SERVE_ALLOWED_VLM_PRESETS") as info:
+        await DoclingRawClient().download_into(
+            tmp_path / "demo.docling_raw", source_pdf
+        )
+    assert "docling>=2.149" in str(info.value)
+    assert "minicpm_ocr" in str(info.value)
+
+
+async def test_docling_client_standard_task_failure_has_no_preset_hint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    source_pdf: Path,
+) -> None:
+    recorder = _Recorder(
+        terminal_status="failure",
+        zip_bytes=_fake_zip_with_main_json("demo"),
+    )
+    _CURRENT["recorder"] = recorder
+    _install_fake_httpx(monkeypatch)
+
+    with pytest.raises(RuntimeError) as info:
+        await DoclingRawClient().download_into(
+            tmp_path / "demo.docling_raw", source_pdf
+        )
+    assert "DOCLING_SERVE_ALLOWED_VLM_PRESETS" not in str(info.value)
+
+
+def test_docling_cache_signature_only_records_pipeline_when_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lightrag.parser.external.docling.cache import snapshot_tunable_env
+    from lightrag.parser.external.docling.client import (
+        FIXED_CONSTANTS,
+        fixed_constants_for,
+    )
+
+    standard = snapshot_tunable_env()
+    assert set(standard) == {
+        "DOCLING_DO_OCR",
+        "DOCLING_FORCE_OCR",
+        "DOCLING_OCR_ENGINE",
+        "DOCLING_OCR_PRESET",
+        "DOCLING_OCR_LANG",
+        "DOCLING_DO_FORMULA_ENRICHMENT",
+    }
+    assert "DOCLING_PIPELINE" not in standard
+    assert "DOCLING_VLM_PRESET" not in standard
+    assert fixed_constants_for("standard") is FIXED_CONSTANTS
+
+    monkeypatch.setenv("DOCLING_PIPELINE", "vlm")
+    monkeypatch.setenv("DOCLING_VLM_PRESET", "minicpm_ocr")
+    vlm = snapshot_tunable_env()
+    assert vlm["DOCLING_PIPELINE"] == "vlm"
+    assert vlm["DOCLING_VLM_PRESET"] == "minicpm_ocr"
+    assert fixed_constants_for("vlm")["pipeline"] == "vlm"
+
+
+def test_vlm_signature_ignores_ocr_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lightrag.parser.external.docling.cache import snapshot_tunable_env
+
+    monkeypatch.setenv("DOCLING_PIPELINE", "vlm")
+    monkeypatch.setenv("DOCLING_VLM_PRESET", "minicpm_ocr")
+    baseline = snapshot_tunable_env()
+
+    # None of these change the VLM request, so the signature must not move.
+    monkeypatch.setenv("DOCLING_DO_OCR", "false")
+    monkeypatch.setenv("DOCLING_OCR_ENGINE", "tesseract")
+    monkeypatch.setenv("DOCLING_OCR_LANG", "zh")
+    assert snapshot_tunable_env() == baseline
+
+
+async def test_docling_client_vlm_warns_about_force_ocr_override(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("DOCLING_PIPELINE", "vlm")
+    monkeypatch.setenv("DOCLING_VLM_PRESET", "minicpm_ocr")
+
+    with caplog.at_level("WARNING"):
+        # The env default is true, so only an override that differs matters.
+        DoclingRawClient(overrides={"force_ocr": False})
+
+    message = "\n".join(record.getMessage() for record in caplog.records)
+    assert "force_ocr" in message
+
+
+async def test_docling_client_vlm_ignores_a_default_matching_override(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("DOCLING_PIPELINE", "vlm")
+    monkeypatch.setenv("DOCLING_VLM_PRESET", "minicpm_ocr")
+
+    with caplog.at_level("WARNING"):
+        DoclingRawClient(overrides={"force_ocr": True})
+
+    assert not [r for r in caplog.records if "force_ocr" in r.getMessage()]
+
+
+async def test_docling_client_warns_when_a_preset_is_set_without_vlm(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("DOCLING_VLM_PRESET", "minicpm_ocr")
+
+    with caplog.at_level("WARNING"):
+        client = DoclingRawClient()
+        DoclingRawClient()
+
+    assert client.pipeline == "standard"
+    warnings = [r for r in caplog.records if "DOCLING_VLM_PRESET" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+async def test_docling_client_vlm_envelope_failure_names_the_preset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    source_pdf: Path,
+) -> None:
+    monkeypatch.setenv("DOCLING_PIPELINE", "vlm")
+    monkeypatch.setenv("DOCLING_VLM_PRESET", "minicpm_ocr")
+    body = json_dump({"status": "failure", "error_message": "unknown vlm preset"})
+    recorder = _Recorder(
+        terminal_status="success",
+        zip_bytes=_fake_zip_with_main_json("demo"),
+        result_content=body.encode(),
+        result_content_type="application/json",
+    )
+    _CURRENT["recorder"] = recorder
+    _install_fake_httpx(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="DOCLING_SERVE_ALLOWED_VLM_PRESETS"):
+        await DoclingRawClient().download_into(
+            tmp_path / "demo.docling_raw", source_pdf
+        )
+
+
+def test_pipeline_signature_changes_with_pipeline_and_preset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lightrag.parser.external.docling.cache import (
+        compute_options_signature,
+        snapshot_tunable_env,
+    )
+    from lightrag.parser.external.docling.client import fixed_constants_for
+
+    def signature() -> str:
+        return compute_options_signature(
+            tunable_env=snapshot_tunable_env(),
+            fixed_constants=fixed_constants_for(
+                (os.environ.get("DOCLING_PIPELINE") or "standard").strip().lower()
+            ),
+        )
+
+    standard = signature()
+    monkeypatch.setenv("DOCLING_PIPELINE", "vlm")
+    monkeypatch.setenv("DOCLING_VLM_PRESET", "minicpm_ocr")
+    vlm_minicpm = signature()
+    monkeypatch.setenv("DOCLING_VLM_PRESET", "granite_docling")
+    vlm_granite = signature()
+
+    assert len({standard, vlm_minicpm, vlm_granite}) == 3
 
 
 async def test_docling_client_partial_success_aborts(
@@ -448,6 +784,247 @@ async def test_docling_client_result_http_error_preserves_response_body(
     assert "zip artifact missing" in message
 
 
+def _docling_document_with_one_block() -> dict:
+    """A minimal but real ``DoclingDocument`` that yields one IR block.
+
+    Mirrors the shape docling-serve nests under
+    ``ConvertDocumentResponse.document.json_content``: a ``body`` referencing
+    one ``texts`` entry so the IR builder produces a non-empty parse.
+    """
+    return {
+        "schema_name": "DoclingDocument",
+        "version": "1.10.0",
+        "origin": {"filename": "demo.pdf", "mimetype": "application/pdf"},
+        "body": {
+            "self_ref": "#/body",
+            "children": [{"$ref": "#/texts/0"}],
+            "content_layer": "body",
+            "label": "unspecified",
+        },
+        "groups": [],
+        "texts": [
+            {
+                "self_ref": "#/texts/0",
+                "label": "title",
+                "text": "Only this text should be extracted.",
+                "orig": "Only this text should be extracted.",
+                "content_layer": "body",
+                "prov": [],
+            }
+        ],
+        "pictures": [],
+        "tables": [],
+        "key_value_items": [],
+        "form_items": [],
+    }
+
+
+def _docling_document_with_picture(uri: str) -> dict:
+    """``_docling_document_with_one_block`` plus one picture referencing ``uri``."""
+    doc = _docling_document_with_one_block()
+    doc["body"]["children"].append({"$ref": "#/pictures/0"})
+    doc["pictures"] = [
+        {
+            "self_ref": "#/pictures/0",
+            "label": "picture",
+            "content_layer": "body",
+            "prov": [],
+            "children": [],
+            "image": {"uri": uri, "mimetype": "image/png"},
+        }
+    ]
+    return doc
+
+
+async def test_docling_client_materializes_json_result_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    source_pdf: Path,
+) -> None:
+    # Real ConvertDocumentResponse shape: the DoclingDocument lives under
+    # ``document.json_content``; ``md_content`` is its sibling. The stored
+    # ``<stem>.json`` must be the inner DoclingDocument, NOT the response
+    # envelope or the ExportDocumentResponse wrapper.
+    json_content = _docling_document_with_one_block()
+    markdown = "# Extracted markdown\n\nOnly this text should be markdown."
+    envelope = {
+        "task_id": "task-abc",
+        "task_status": "success",
+        "document": {
+            "filename": "demo.pdf",
+            "md_content": markdown,
+            "json_content": json_content,
+        },
+    }
+    recorder = _Recorder(
+        terminal_status="success",
+        zip_bytes=b"",
+        result_content=json_dump(envelope).encode("utf-8"),
+        result_content_type="application/json",
+    )
+    _CURRENT["recorder"] = recorder
+    _install_fake_httpx(monkeypatch)
+
+    raw_dir = tmp_path / "demo.docling_raw"
+    manifest = await DoclingRawClient().download_into(raw_dir, source_pdf)
+
+    stored = json.loads((raw_dir / "demo.json").read_text(encoding="utf-8"))
+    assert stored == json_content
+    # Neither the envelope nor the ExportDocumentResponse wrapper leaks in.
+    assert "task_status" not in stored
+    assert "json_content" not in stored
+    assert "md_content" not in stored
+    assert (raw_dir / "demo.md").read_text(encoding="utf-8") == markdown
+    assert manifest.critical_file.path == "demo.json"
+    assert {f.path for f in manifest.files} == {"demo.md"}
+
+
+async def test_docling_client_json_envelope_is_parseable_by_ir_builder(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    source_pdf: Path,
+) -> None:
+    """End-to-end guard for #2996: a materialized JSON envelope must feed the
+    IR builder and yield non-empty blocks (storing the wrapper would produce
+    zero blocks and fail ``validate_ir``)."""
+    from lightrag.parser.external.docling.ir_builder import DoclingIRBuilder
+
+    envelope = {
+        "task_id": "task-abc",
+        "task_status": "success",
+        "document": {
+            "filename": "demo.pdf",
+            "md_content": "# Extracted markdown\n",
+            "json_content": _docling_document_with_one_block(),
+        },
+    }
+    recorder = _Recorder(
+        terminal_status="success",
+        zip_bytes=b"",
+        result_content=json_dump(envelope).encode("utf-8"),
+        result_content_type="application/json",
+    )
+    _CURRENT["recorder"] = recorder
+    _install_fake_httpx(monkeypatch)
+
+    raw_dir = tmp_path / "demo.docling_raw"
+    await DoclingRawClient().download_into(raw_dir, source_pdf)
+
+    ir = DoclingIRBuilder().normalize_from_workdir(raw_dir, document_name="demo.pdf")
+    assert ir.blocks, "materialized JSON envelope produced zero IR blocks"
+    assert ir.doc_title == "Only this text should be extracted."
+
+
+async def test_docling_client_rejects_non_success_json_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    source_pdf: Path,
+) -> None:
+    """A JSON result envelope whose own status is not ``success`` must abort
+    instead of caching a partial conversion as a successful bundle — even when
+    the async poll reported success and the envelope still carries a document."""
+    envelope = {
+        "task_id": "task-abc",
+        "task_status": "partial_success",
+        "document": {
+            "filename": "demo.pdf",
+            "md_content": "# Partial\n",
+            "json_content": _docling_document_with_one_block(),
+        },
+    }
+    recorder = _Recorder(
+        terminal_status="success",  # async task poll succeeds ...
+        zip_bytes=b"",
+        result_content=json_dump(envelope).encode("utf-8"),
+        result_content_type="application/json",
+    )
+    _CURRENT["recorder"] = recorder
+    _install_fake_httpx(monkeypatch)
+
+    raw_dir = tmp_path / "demo.docling_raw"
+    with pytest.raises(RuntimeError) as excinfo:
+        await DoclingRawClient().download_into(raw_dir, source_pdf)
+
+    assert "partial_success" in str(excinfo.value)
+    # Nothing was materialized: no document, no markdown, no manifest.
+    assert not (raw_dir / "demo.json").exists()
+    assert not (raw_dir / "demo.md").exists()
+    assert not (raw_dir / "_manifest.json").exists()
+
+
+async def test_docling_client_rejects_referenced_image_artifacts_in_json_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    source_pdf: Path,
+) -> None:
+    """A JSON envelope whose DoclingDocument references ``artifacts/`` images
+    must abort: the JSON path cannot deliver those files, so materializing would
+    silently drop the pictures and still cache the bundle as a success."""
+    envelope = {
+        "task_id": "task-abc",
+        "task_status": "success",
+        "document": {
+            "filename": "demo.pdf",
+            "md_content": "# md\n",
+            "json_content": _docling_document_with_picture("artifacts/image_000.png"),
+        },
+    }
+    recorder = _Recorder(
+        terminal_status="success",
+        zip_bytes=b"",
+        result_content=json_dump(envelope).encode("utf-8"),
+        result_content_type="application/json",
+    )
+    _CURRENT["recorder"] = recorder
+    _install_fake_httpx(monkeypatch)
+
+    raw_dir = tmp_path / "demo.docling_raw"
+    with pytest.raises(RuntimeError) as excinfo:
+        await DoclingRawClient().download_into(raw_dir, source_pdf)
+
+    assert "artifacts/image_000.png" in str(excinfo.value)
+    assert not (raw_dir / "demo.json").exists()
+    assert not (raw_dir / "demo.md").exists()
+    assert not (raw_dir / "_manifest.json").exists()
+
+
+async def test_docling_client_json_result_preserves_embedded_image(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    source_pdf: Path,
+) -> None:
+    """Embedded (``data:``) images carry their own bytes, so the guard is a
+    no-op and the base64 is preserved verbatim in the stored ``<stem>.json``
+    (the IR builder decodes it into the sidecar assets dir downstream)."""
+    data_uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAAAAgAB"
+    json_content = _docling_document_with_picture(data_uri)
+    envelope = {
+        "task_id": "task-abc",
+        "task_status": "success",
+        "document": {
+            "filename": "demo.pdf",
+            "md_content": "# md\n",
+            "json_content": json_content,
+        },
+    }
+    recorder = _Recorder(
+        terminal_status="success",
+        zip_bytes=b"",
+        result_content=json_dump(envelope).encode("utf-8"),
+        result_content_type="application/json",
+    )
+    _CURRENT["recorder"] = recorder
+    _install_fake_httpx(monkeypatch)
+
+    raw_dir = tmp_path / "demo.docling_raw"
+    manifest = await DoclingRawClient().download_into(raw_dir, source_pdf)
+
+    stored = json.loads((raw_dir / "demo.json").read_text(encoding="utf-8"))
+    assert stored == json_content
+    assert stored["pictures"][0]["image"]["uri"] == data_uri
+    assert manifest.critical_file.path == "demo.json"
+
+
 async def test_docling_client_encodes_task_id_into_url_path_segment(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -594,3 +1171,90 @@ async def test_docling_client_default_upload_filename_falls_back_to_source_name(
 
     name, _blob, _ctype = recorder.post_calls[0]["files"]["files"]
     assert name == "demo.pdf"
+
+
+async def test_docling_result_zip_is_extracted_under_a_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source_pdf: Path
+) -> None:
+    # ``safe_extract_zip`` defaults both guards to unlimited, so an
+    # unbudgeted call inherits no zip-bomb protection at all. The docling
+    # server is operator-configured rather than attacker-supplied, which
+    # makes this depth rather than the defect in GHSA-2wpj-ffvv-2pq8 — but
+    # the call has to pass real values for the guards to exist.
+    recorder = _Recorder(
+        terminal_status="success",
+        zip_bytes=_fake_zip_with_main_json("demo"),
+    )
+    _CURRENT["recorder"] = recorder
+    _install_fake_httpx(monkeypatch)
+
+    seen: dict[str, object] = {}
+    real = client_mod.safe_extract_zip
+
+    def _spy(payload, dest_dir, **kwargs):
+        seen.update(kwargs)
+        return real(payload, dest_dir, **kwargs)
+
+    monkeypatch.setattr(client_mod, "safe_extract_zip", _spy)
+
+    await DoclingRawClient().download_into(tmp_path / "demo.docling_raw", source_pdf)
+
+    assert isinstance(seen.get("max_entries"), int)
+    assert seen["max_entries"] > 0
+    assert isinstance(seen.get("max_total_bytes"), int)
+    assert seen["max_total_bytes"] > 0
+
+
+async def test_docling_oversized_result_zip_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source_pdf: Path
+) -> None:
+    recorder = _Recorder(
+        terminal_status="success",
+        zip_bytes=_fake_zip_with_main_json("demo"),
+    )
+    _CURRENT["recorder"] = recorder
+    _install_fake_httpx(monkeypatch)
+    monkeypatch.setenv("PARSER_RESULT_BUNDLE_MAX_TOTAL_BYTES", "8")
+
+    with pytest.raises(RuntimeError) as exc:
+        await DoclingRawClient().download_into(
+            tmp_path / "demo.docling_raw", source_pdf
+        )
+    # stream_capped_get has its own separate PARSER_RESULT_BUNDLE_DOWNLOAD_MAX_BYTES
+    # budget (unset here, so it stays at its generous default) and does not
+    # consult this uncompressed-size cap -- only safe_extract_zip's
+    # declared-size check below sees it. See
+    # test_docling_declared_size_lies_but_raw_response_is_small for more
+    # coverage of that same check.
+    assert "uncompressed size" in str(exc.value)
+
+
+async def test_docling_result_bundle_budget_can_be_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source_pdf: Path
+) -> None:
+    """A non-positive env value disables that gate (maps to None = unlimited).
+
+    Passing 0 straight into safe_extract_zip would refuse every bundle; the
+    live-read must map non-positive to None so an operator whose legitimate
+    result bundle exceeds the default ceiling can raise/disable it without a
+    code change.
+    """
+    recorder = _Recorder(
+        terminal_status="success",
+        zip_bytes=_fake_zip_with_main_json("demo"),
+    )
+    _CURRENT["recorder"] = recorder
+    _install_fake_httpx(monkeypatch)
+    # A ceiling below the real bundle size that would refuse it if honored...
+    monkeypatch.setenv("PARSER_RESULT_BUNDLE_MAX_TOTAL_BYTES", "8")
+    monkeypatch.setenv("PARSER_RESULT_BUNDLE_MAX_ENTRIES", "1")
+
+    with pytest.raises(RuntimeError):
+        await DoclingRawClient().download_into(
+            tmp_path / "demo.docling_raw", source_pdf
+        )
+
+    # ...disabled by a non-positive value, the bundle extracts normally.
+    monkeypatch.setenv("PARSER_RESULT_BUNDLE_MAX_TOTAL_BYTES", "0")
+    monkeypatch.setenv("PARSER_RESULT_BUNDLE_MAX_ENTRIES", "0")
+    await DoclingRawClient().download_into(tmp_path / "demo2.docling_raw", source_pdf)

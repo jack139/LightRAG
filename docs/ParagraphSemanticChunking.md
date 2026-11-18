@@ -376,7 +376,7 @@ Internally the implementation also uses temporary fields like `paragraphs`, `con
 | `CHUNK_P_OVERLAP_SIZE` | Unset (inherits `CHUNK_OVERLAP_SIZE`) | P-specific overlap; affects only long-body fallback within one content line and the table bridge budget, and does **not** make table row-level slices overlap each other |
 | `CHUNK_OVERLAP_SIZE` / `LightRAG(chunk_overlap_token_size=…)` | `100` | Global fallback when no P-specific overlap is set |
 
-For config syntax, the precedence chain, runtime overrides via `addon_params["chunker"]`, etc., see [FileProcessingConfiguration-zh.md](FileProcessingConfiguration-zh.md) §3.
+For config syntax, the precedence chain, runtime overrides via `addon_params["chunker"]`, etc., see [FileProcessingPipeline.md](./FileProcessingPipeline.md).
 
 `P` is a chunking option orthogonal to the engine (`suffix:engine-options`) and can combine with any sidecar-producing engine. A typical `LIGHTRAG_PARSER` setup enabling P:
 
@@ -422,7 +422,7 @@ If the file is missing or empty, the P strategy degrades wholesale to R and gain
 
 - No sidecar-producing engine was configured for that format (e.g. `LIGHTRAG_PARSER=docx:native-...` / `pdf:mineru-...` / `*:docling-...`), so it actually took the `legacy` path.
 - Parse failure (check the `pipeline_status` error entries).
-- The format is not supported by the chosen engine (e.g. native supports only docx; switch to mineru / docling to cover more formats).
+- The format is not supported by the chosen engine (e.g. native supports `.docx`, `.md`, and `.textpack`; use MinerU or Docling for other supported formats).
 
 ### 7.2 Check the blocks.jsonl Content
 
@@ -440,7 +440,7 @@ If heading is mostly empty or level is abnormal, the parser did not correctly id
 Inspect the chunk metadata in the `text_chunks` store:
 
 ```bash
-jq '.[] | {heading, level, tokens, parent_headings}' \
+jq '.[] | {heading: .heading.heading, level: .heading.level, tokens, parent_headings: .heading.parent_headings}' \
    rag_storage/kv_store_text_chunks.json | head -30
 ```
 

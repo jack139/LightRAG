@@ -9,10 +9,18 @@ from argparse import ArgumentParser, Namespace
 import argparse
 import json
 from dataclasses import asdict, dataclass, field
-from typing import Any, ClassVar, List, get_args, get_origin
+from typing import Any, ClassVar, List, Literal, Union, get_args, get_origin
 
 from lightrag.utils import get_env_value
 from lightrag.constants import DEFAULT_TEMPERATURE
+
+# Spellings accepted for boolean-valued options. Shared so the plain-bool and
+# the bool-or-literal parsers below cannot drift apart.
+_BOOL_TRUE_WORDS = ("true", "1", "yes", "t", "on")
+# Only consulted by the bool-or-literal parser: plain bools treat "anything not
+# true" as false, whereas an option that also accepts named values has to tell
+# a deliberate false from a typo (see _make_bool_or_literal_parser).
+_BOOL_FALSE_WORDS = ("false", "0", "no", "f", "off", "")
 
 
 def _resolve_optional_type(field_type: Any) -> Any:
@@ -27,6 +35,60 @@ def _resolve_optional_type(field_type: Any) -> Any:
         if len(non_none_args) == 1:
             return non_none_args[0]
     return field_type
+
+
+def _bool_or_literal_choices(field_type: Any) -> tuple[str, ...] | None:
+    """Named string values of a ``Union[bool, Literal["a", "b"]]`` annotation.
+
+    Some provider options are a boolean that additionally accepts a few named
+    levels -- Ollama's ``think`` is on/off *or* ``low``/``medium``/``high``.
+    Returns the literal spellings for such an annotation and ``None`` for
+    everything else, so the parsers below stay generic instead of special-casing
+    one field. Written with ``typing.Union`` on purpose: ``bool | Literal[...]``
+    builds a ``types.UnionType`` whose ``get_origin`` is not ``Union``, and this
+    detection would silently miss it.
+    """
+    if get_origin(field_type) is not Union:
+        return None
+    args = get_args(field_type)
+    literals = [arg for arg in args if get_origin(arg) is Literal]
+    if len(args) != 2 or len(literals) != 1 or bool not in args:
+        return None
+    choices = get_args(literals[0])
+    if not all(isinstance(choice, str) for choice in choices):
+        return None
+    return choices
+
+
+def _make_bool_or_literal_parser(choices: tuple[str, ...], env_name: str):
+    """Build the value parser for a :func:`_bool_or_literal_choices` field.
+
+    Unrecognized input raises instead of falling back. A plain bool option can
+    afford "not true means false", but here a typo (``hgih`` for ``high``) would
+    otherwise be silently downgraded to *off* -- turning a feature the user
+    asked to dial up into one they turned off, with nothing in the logs. That
+    also deliberately differs from the list/dict branches of ``add_args``, which
+    treat unparseable env values as unset: raising surfaces the mistake while
+    the server is still starting.
+    """
+
+    def parse(value):
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in _BOOL_TRUE_WORDS:
+            return True
+        if text in _BOOL_FALSE_WORDS:
+            return False
+        if text in choices:
+            return text
+        raise argparse.ArgumentTypeError(
+            f"{env_name}={value!r} is not valid: expected a boolean "
+            f"({'/'.join(_BOOL_TRUE_WORDS[:2])}/{'/'.join(_BOOL_FALSE_WORDS[:2])}) "
+            f"or one of {', '.join(choices)}"
+        )
+
+    return parse
 
 
 # =============================================================================
@@ -168,6 +230,27 @@ class BindingOptions:
                     default=env_value,
                     help=arg_item["help"],
                 )
+            # Handle booleans that also accept a few named levels (Ollama's
+            # think). Checked before the plain-bool branch: the annotation is a
+            # Union, so `is bool` would miss it and argparse would be handed the
+            # Union itself as a value converter.
+            elif bool_literal_choices := _bool_or_literal_choices(arg_item["type"]):
+                bool_or_literal_parser = _make_bool_or_literal_parser(
+                    bool_literal_choices, arg_item["env_name"]
+                )
+                # get_env_value with no value_type hands back the raw string;
+                # the parser owns every conversion, including the raise on
+                # garbage -- which propagates out of parse_args() by design.
+                env_value = get_env_value(f"{arg_item['env_name']}", argparse.SUPPRESS)
+                if env_value is not argparse.SUPPRESS:
+                    env_value = bool_or_literal_parser(env_value)
+
+                group.add_argument(
+                    f"--{arg_item['argname']}",
+                    type=bool_or_literal_parser,
+                    default=env_value,
+                    help=arg_item["help"],
+                )
             # Handle boolean types specially to avoid argparse bool() constructor issues
             elif arg_item["type"] is bool:
 
@@ -176,7 +259,7 @@ class BindingOptions:
                     if isinstance(value, bool):
                         return value
                     if isinstance(value, str):
-                        return value.lower() in ("true", "1", "yes", "t", "on")
+                        return value.strip().lower() in _BOOL_TRUE_WORDS
                     return bool(value)
 
                 # Get environment variable with proper type conversion
@@ -381,15 +464,23 @@ class BindingOptions:
                 continue
 
             field_type = _resolve_optional_type(arg_item["type"])
+
+            # Handled ahead of (and outside) the try below on purpose: that
+            # except clause turns a failed conversion into "store the raw
+            # string", which for a bool-or-literal option would smuggle e.g.
+            # "hgih" into the provider payload and fail at request time instead
+            # of here. ArgumentTypeError is not caught by it either way; the
+            # placement makes the intent explicit rather than incidental.
+            literal_choices = _bool_or_literal_choices(field_type)
+            if literal_choices is not None:
+                base[field_name] = _make_bool_or_literal_parser(
+                    literal_choices, role_env
+                )(env_raw)
+                continue
+
             try:
                 if field_type is bool:
-                    base[field_name] = env_raw.lower() in (
-                        "true",
-                        "1",
-                        "yes",
-                        "t",
-                        "on",
-                    )
+                    base[field_name] = env_raw.strip().lower() in _BOOL_TRUE_WORDS
                 elif field_type in (list, List[str]):
                     base[field_name] = json.loads(env_raw)
                 elif field_type is dict:
@@ -516,6 +607,13 @@ class _OllamaOptionsMixin:
         "embedding_only": "Only use for embeddings",
         "penalize_newline": "Penalize newline tokens",
         "stop": 'Stop sequences (JSON array of strings, e.g., \'["</s>", "\\n\\n"]\')',
+        "think": (
+            "Enable the model's extended-thinking/reasoning trace (LLM only, ignored "
+            "for embeddings). true/false or a reasoning level (low/medium/high, needs "
+            "an Ollama server that supports levels). Leave unset to follow the "
+            "model's own default -- setting true for a model without thinking support "
+            "makes Ollama reject the request"
+        ),
     }
 
 
@@ -530,6 +628,29 @@ class OllamaEmbeddingOptions(_OllamaOptionsMixin, BindingOptions):
 @dataclass
 class OllamaLLMOptions(_OllamaOptionsMixin, BindingOptions):
     """Options for Ollama LLM with specialized configuration for LLM tasks."""
+
+    # Whether the model may emit a hidden reasoning trace before its answer.
+    # Only meaningful for LLM calls, not embeddings, hence living here rather
+    # than on _OllamaOptionsMixin. Defaults to True (matching each model's
+    # own default) for every role, including extraction/keyword, and the
+    # framework never overrides that default itself. A thinking-capable
+    # model can exhaust its whole generation budget on hidden reasoning
+    # before extraction ever emits structured output, but
+    # disabling thinking isn't universally correct either -- it measurably
+    # hurts extraction quality on some smaller models. That's a judgment
+    # call about a specific model, which the person running it is better
+    # placed to make than this library: set EXTRACT_OLLAMA_LLM_THINK=false
+    # / KEYWORD_OLLAMA_LLM_THINK=false (or OLLAMA_LLM_THINK=false globally)
+    # if your model needs it.
+    #
+    # The True here is documentation, not a value that ships: every field is
+    # argparse.SUPPRESS-defaulted, so an unconfigured think stays absent from
+    # the options dict and out of the request body entirely, leaving Ollama to
+    # apply its own default (which, for a thinking-capable model, is exactly
+    # this True). Beyond on/off, Ollama accepts named reasoning levels, hence
+    # the Union -- spelled with typing.Union because `bool | Literal[...]` is a
+    # types.UnionType that _bool_or_literal_choices does not recognize.
+    think: Union[bool, Literal["low", "medium", "high"]] = True
 
     # mandatory name of binding
     _binding_name: ClassVar[str] = "ollama_llm"
@@ -567,7 +688,7 @@ class GeminiLLMOptions(BindingOptions):
         "stop_sequences": "Stop sequences (JSON array of strings, e.g., '[\"END\"]')",
         "seed": "Random seed for reproducible generation (leave empty for random)",
         "thinking_config": "Thinking configuration (JSON dict, e.g., '{\"thinking_budget\": 1024}' or '{\"include_thoughts\": true}')",
-        "safety_settings": "JSON object with Gemini safety settings overrides",
+        "safety_settings": 'Safety settings as a JSON object mapping category to threshold (e.g., \'{"HARM_CATEGORY_HARASSMENT": "BLOCK_NONE"}\')',
     }
 
 
@@ -627,6 +748,49 @@ class OpenAILLMOptions(BindingOptions):
         "top_p": "Nucleus sampling parameter (0.0-1.0, lower = more focused)",
         "max_tokens": "Maximum number of tokens to generate (deprecated, use max_completion_tokens instead)",
         "extra_body": 'Extra body parameters for OpenRouter of vLLM (JSON dict, e.g., \'"reasoning": {"reasoning": {"enabled": false}}\')',
+    }
+
+
+# =============================================================================
+# Binding Options for OpenAI Responses API
+# =============================================================================
+#
+# Deliberately a separate namespace from ``openai_llm``: the Responses API
+# spells several parameters differently (``max_output_tokens`` rather than
+# ``max_completion_tokens``, a nested ``reasoning`` object rather than a flat
+# ``reasoning_effort``) and does not accept others at all. Sharing the
+# ``OPENAI_LLM_*`` namespace would let Chat Completions settings leak into the
+# Responses driver, where they are either wrong or rejected.
+# =============================================================================
+@dataclass
+class OpenAIResponsesLLMOptions(BindingOptions):
+    """Options for the OpenAI Responses API (``/v1/responses``)."""
+
+    # mandatory name of binding
+    _binding_name: ClassVar[str] = "openai_responses_llm"
+
+    # Sampling and generation parameters
+    max_output_tokens: int = None  # Maximum number of output tokens to generate
+    reasoning_effort: str = ""  # Reasoning effort level (minimal, low, medium, high)
+    reasoning_summary: str = ""  # Reasoning summary detail (auto, concise, detailed)
+    service_tier: str = ""  # Service tier for API usage
+    store: bool = False  # Server-side retention; the driver sends false unless set
+    temperature: float = DEFAULT_TEMPERATURE  # Controls randomness (0.0 to 2.0)
+    top_p: float = 1.0  # Nucleus sampling parameter (0.0 to 1.0)
+    truncation: str = ""  # Context-overflow strategy (auto, disabled)
+    extra_body: dict = None  # Extra body parameters for compatible gateways
+
+    # Help descriptions
+    _help: ClassVar[dict[str, str]] = {
+        "max_output_tokens": "Maximum number of output tokens to generate (optional, leave empty for model default)",
+        "reasoning_effort": "Reasoning effort for reasoning models (minimal, low, medium, high); sent as reasoning.effort",
+        "reasoning_summary": "Request reasoning summaries (auto, concise, detailed) so enable_cot calls can emit <think> content; sent as reasoning.summary. Leave empty for models without reasoning",
+        "service_tier": "Service tier for API usage (optional)",
+        "store": "Whether OpenAI retains the response server-side for later retrieval (default false; the API's own default is true)",
+        "temperature": "Controls randomness (0.0-2.0, higher = more creative)",
+        "top_p": "Nucleus sampling parameter (0.0-1.0, lower = more focused)",
+        "truncation": "Context-overflow strategy (auto, disabled)",
+        "extra_body": 'Extra body parameters for OpenAI-compatible gateways (JSON dict, e.g., \'{"foo": "bar"}\')',
     }
 
 

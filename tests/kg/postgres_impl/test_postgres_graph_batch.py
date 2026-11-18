@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock
 from lightrag.kg.postgres_impl import PGGraphStorage
 
 
+pytestmark = pytest.mark.offline
+
 # ---------------------------------------------------------------------------
 # Capture harness
 # ---------------------------------------------------------------------------
@@ -43,6 +45,12 @@ class _FakeConnection:
     async def execute(self, sql, *args):
         self._capture.calls.append({"sql": sql, "args": args})
         return ""
+
+    async def fetch(self, sql, *args):
+        # The edge chunk path runs each Cypher through fetch() and raises when a
+        # statement returns no created edge (missing endpoints), so return a row.
+        self._capture.calls.append({"sql": sql, "args": args})
+        return [{"r": "edge"}]
 
 
 def make_graph_storage(

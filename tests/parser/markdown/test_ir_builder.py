@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import pytest
+
 from lightrag.parser.markdown.extract import (
     drawing_marker,
     equation_marker,
     table_marker,
 )
 from lightrag.parser.markdown.ir_builder import NativeMarkdownIRBuilder
+
+
+pytestmark = pytest.mark.offline
 
 
 def _normalize(blocks, meta, *, document_name="doc.md"):
@@ -19,6 +24,7 @@ def _normalize(blocks, meta, *, document_name="doc.md"):
     )
 
 
+@pytest.mark.offline
 def test_pipe_table_becomes_json_irtable_with_header_grid():
     blocks = [
         {
@@ -36,10 +42,10 @@ def test_pipe_table_becomes_json_irtable_with_header_grid():
     ir = _normalize(blocks, meta)
     (table,) = ir.blocks[0].tables
     assert "{{TBL:" in ir.blocks[0].content_template
-    assert table.rows == [["a", "b"]]
+    assert table.rows == [["H1", "H2"], ["a", "b"]]
     assert table.html is None
     assert table.table_header == [["H1", "H2"]]
-    assert (table.num_rows, table.num_cols) == (1, 2)
+    assert (table.num_rows, table.num_cols) == (2, 2)
 
 
 def test_html_table_becomes_html_irtable_with_thead_and_dims():
@@ -58,6 +64,26 @@ def test_html_table_becomes_html_irtable_with_thead_and_dims():
     assert table.html and table.html.startswith("<table>")
     assert isinstance(table.table_header, str) and "<thead>" in table.table_header
     assert table.body_override and "<thead>" in table.body_override
+    assert (table.num_rows, table.num_cols) == (2, 2)
+
+
+@pytest.mark.offline
+def test_html_table_optional_end_tags_keep_dimensions_in_ir():
+    html = "<table><thead><tr><th>K<th>V</thead><tbody><tr><td>a<td>1</tbody></table>"
+    blocks = [
+        {
+            "heading": "H",
+            "level": 1,
+            "parent_headings": [],
+            "content": table_marker("t1"),
+        }
+    ]
+
+    ir = _normalize(blocks, {"md_tables": {"t1": {"kind": "html", "html": html}}})
+    (table,) = ir.blocks[0].tables
+
+    assert table.html == html
+    assert table.table_header == "<thead><tr><th>K<th>V</thead>"
     assert (table.num_rows, table.num_cols) == (2, 2)
 
 
@@ -96,7 +122,7 @@ def test_local_drawing_dedups_assetspec_across_occurrences():
     assert ir.assets[0].source == b"BYTES"
 
 
-def test_external_drawing_uses_path_override_and_no_asset():
+def test_external_drawing_keeps_src_and_no_asset():
     blocks = [
         {
             "heading": "H",
@@ -117,8 +143,9 @@ def test_external_drawing_uses_path_override_and_no_asset():
     }
     ir = _normalize(blocks, meta)
     (drawing,) = ir.blocks[0].drawings
-    assert drawing.path_override == "http://x/y.png"
+    # Not materialized: no asset ref (renders as path=""), URL kept in src.
     assert drawing.asset_ref == ""
+    assert drawing.src == "http://x/y.png"
     assert ir.assets == []
 
 

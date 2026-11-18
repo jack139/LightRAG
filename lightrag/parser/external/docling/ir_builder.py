@@ -6,8 +6,7 @@ produced by docling-serve with ``to_formats=[json,md]`` +
 ``artifacts/`` are not read by the builder (markdown stays for human
 inspection; image bytes are referenced by relative URI).
 
-Conversion rules (informed by
-``docs/DoclingSidecarRefactorPlan-zh.md`` §5):
+Conversion rules:
 
 - **Faithful** mapping. We do NOT correct heading levels from numbering,
   do NOT bind orphan ``caption`` / ``footnote`` text to neighbouring
@@ -144,7 +143,7 @@ class DoclingIRBuilder:
         # Heading stack + current block accumulator — identical structure
         # to MinerUIRBuilder so downstream P-chunking and provenance behave
         # the same way regardless of engine.
-        heading_stack: list[str] = []
+        heading_stack: list[tuple[int, str]] = []
         cb_lines: list[str] = []
         cb_tables: list[IRTable] = []
         cb_drawings: list[IRDrawing] = []
@@ -347,7 +346,7 @@ class DoclingIRBuilder:
                 _append_text(line)
 
         def _handle_text(item: dict) -> None:
-            nonlocal doc_title, heading_stack
+            nonlocal doc_title
             label = str(item.get("label") or "").lower()
             text = _text_of(item).strip()
 
@@ -355,9 +354,10 @@ class DoclingIRBuilder:
             heading_level = _docling_heading_level(label, item)
             if heading_level > 0 and text:
                 clean_heading = strip_heading_markdown_prefix(text)
-                heading_stack = heading_stack[: max(heading_level - 1, 0)]
-                parents = [h for h in heading_stack if h]
-                heading_stack.append(clean_heading)
+                while heading_stack and heading_stack[-1][0] >= heading_level:
+                    heading_stack.pop()
+                parents = [h for _, h in heading_stack if h]
+                heading_stack.append((heading_level, clean_heading))
                 # Every recognized heading starts its own block: flush the
                 # in-flight block (body or bare heading) and open a fresh one.
                 # A heading with no following body becomes a standalone block
@@ -913,8 +913,7 @@ def _build_ir_drawing(
 
     asset_ref = ""
     asset: AssetSpec | None = None
-    path_override: str | None = None
-    drawing_kwargs: dict[str, Any] = {}
+    src_val = str(item.get("src") or "")
 
     if not uri:
         return None
@@ -942,8 +941,10 @@ def _build_ir_drawing(
             )
             return None
     elif uri.startswith(("http://", "https://")):
-        path_override = uri
-        asset_ref = uri
+        # Remote image the engine did not materialize: no asset, path
+        # renders empty, and the URL survives only as src metadata.
+        src_val = uri
+        asset_ref = ""
     else:
         asset_ref = uri
         if asset_ref not in seen_asset_refs:
@@ -969,19 +970,15 @@ def _build_ir_drawing(
                 return None
             seen_asset_refs[asset_ref] = suggested
 
-    if path_override is not None:
-        drawing_kwargs["path_override"] = path_override
-
     drawing = IRDrawing(
         placeholder_key="",
         asset_ref=asset_ref,
         fmt=fmt,
         caption=" / ".join(captions),
         footnotes=footnotes,
-        src=str(item.get("src") or ""),
+        src=src_val,
         self_ref=str(item.get("self_ref") or ""),
         extras=extras,
-        **drawing_kwargs,
     )
     return drawing, asset
 

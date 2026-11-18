@@ -36,12 +36,18 @@ Common fields:
 
 | Variable | Description |
 | --- | --- |
-| `LLM_BINDING` | Base LLM provider. Supported values are `openai`, `ollama`, `lollms`, `azure_openai`, `bedrock`, and `gemini`. |
+| `LLM_BINDING` | Base LLM provider. Supported values are `openai`, `openai_responses`, `ollama`, `lollms`, `azure_openai`, `bedrock`, and `gemini`. |
 | `LLM_MODEL` | Base model name. For Azure OpenAI, this is usually the deployment name. |
 | `LLM_BINDING_HOST` | Base provider endpoint. For SDK default endpoints, use the corresponding sentinel, such as `DEFAULT_GEMINI_ENDPOINT` or `DEFAULT_BEDROCK_ENDPOINT`. |
 | `LLM_BINDING_API_KEY` | Base API key. Bedrock does not use this field. |
-| `LLM_TIMEOUT` | Base LLM timeout. A role inherits it when no role timeout is set. |
+| `LLM_TIMEOUT` | Base LLM timeout. A role inherits it when no role timeout is set. `0` leaves the provider SDK's default timeout in place. |
 | `MAX_ASYNC_LLM` | Base maximum LLM concurrency. A role inherits it when `{ROLE}_MAX_ASYNC_LLM` is not set. `MAX_ASYNC` is still accepted as a deprecated alias. |
+
+### File-processing interaction
+
+`MAX_ASYNC_LLM` is also the base value used by the file-processing scheduler: for one document, chunk entity/relation extraction runs at most this many tasks concurrently, and each entity-merge or relation-merge phase runs at most twice this many tasks. These are pipeline task limits, not a replacement for role-level request limiting.
+
+The Extract role performs both chunk extraction and description summaries during graph merging. `EXTRACT_MAX_ASYNC_LLM`, when set, limits its actual LLM requests; otherwise it inherits `MAX_ASYNC_LLM`. Changing this role override does not change the scheduler's per-document task limits. See [File Processing Pipeline Specification](FileProcessingPipeline.md#86-pipeline-concurrency-parameters) for the complete worker topology.
 
 ## Role Override Variables
 
@@ -65,7 +71,7 @@ Variable format:
 | `{ROLE}_LLM_BINDING_HOST` | Overrides the role endpoint. |
 | `{ROLE}_LLM_BINDING_API_KEY` | Overrides the role API key. Bedrock does not support it. |
 | `{ROLE}_MAX_ASYNC_LLM` | Overrides the role maximum concurrency. Inherits `MAX_ASYNC_LLM` when unset. |
-| `{ROLE}_LLM_TIMEOUT` | Overrides the role timeout. Inherits `LLM_TIMEOUT` when unset. |
+| `{ROLE}_LLM_TIMEOUT` | Overrides the role timeout. Inherits `LLM_TIMEOUT` when unset; `0` gives the role the provider SDK's default timeout. |
 
 ## Provider Option Overrides
 
@@ -95,10 +101,15 @@ Common provider prefixes:
 | Provider | Base option prefix | Role option example |
 | --- | --- | --- |
 | `openai` / `azure_openai` | `OPENAI_LLM_*` | `QUERY_OPENAI_LLM_REASONING_EFFORT` |
+| `openai_responses` | `OPENAI_RESPONSES_LLM_*` (separate namespace; `OPENAI_LLM_*` does not apply) | `QUERY_OPENAI_RESPONSES_LLM_REASONING_EFFORT` |
 | `ollama` | `OLLAMA_LLM_*` | `EXTRACT_OLLAMA_LLM_NUM_PREDICT` |
 | `lollms` | Uses the Ollama-compatible option set | `QUERY_OLLAMA_LLM_TEMPERATURE` |
 | `bedrock` | `BEDROCK_LLM_*` | `EXTRACT_BEDROCK_LLM_MAX_TOKENS` |
 | `gemini` | `GEMINI_LLM_*` | `VLM_GEMINI_LLM_THINKING_CONFIG` |
+
+This guide covers the role prefix and the inheritance rules. For the `{FIELD}` half —
+every option each prefix accepts, its type, its value syntax, and what the provider
+driver does with it — see [LLM and Embedding Provider Options Reference](./LLMProviderOptions.md).
 
 ## Inheritance Rules
 
@@ -184,6 +195,7 @@ EXTRACT_BEDROCK_LLM_MAX_TOKENS=2048
 | Provider | Role-level host/base_url | Role-level API key | Authentication limitations |
 | --- | --- | --- | --- |
 | `openai` | Supported, passed to the OpenAI-compatible client through `{ROLE}_LLM_BINDING_HOST`. | Supports `{ROLE}_LLM_BINDING_API_KEY`; when unset within the same provider, it inherits the base `LLM_BINDING_API_KEY`. | Currently mainly API key / Bearer mode. |
+| `openai_responses` | Same as `openai`; the host must implement `/v1/responses`. | Same as `openai`. | Same as `openai`. |
 | `ollama` | Supported, passed to the Ollama client through `{ROLE}_LLM_BINDING_HOST`. | Supports `{ROLE}_LLM_BINDING_API_KEY`; when unset within the same provider, it inherits the base key. If no key reaches the lower layer, it falls back to `OLLAMA_API_KEY`. | Bearer header. |
 | `lollms` | Supported, using `{ROLE}_LLM_BINDING_HOST` as `base_url`. | Supports `{ROLE}_LLM_BINDING_API_KEY`; when unset within the same provider, it inherits the base key. | Bearer header. |
 | `azure_openai` | Supported, using `{ROLE}_LLM_BINDING_HOST` as the Azure endpoint. | Supports `{ROLE}_LLM_BINDING_API_KEY`; when unset within the same provider, it inherits the base key and may also fall back to `AZURE_OPENAI_API_KEY`. | `AZURE_OPENAI_API_VERSION` is a global environment variable and does not support role-level overrides. |
@@ -341,7 +353,7 @@ VLM_LLM_TIMEOUT=240
 
 If VLM uses the same provider and key, `VLM_LLM_BINDING_HOST` and `VLM_LLM_BINDING_API_KEY` can be omitted.
 
-`VLM_PROCESS_ENABLE` is the master switch for multimodal analysis. When `false`, the pipeline emits a warning and skips every multimodal item without invoking the VLM. When `true`, the effective VLM binding (`VLM_LLM_BINDING` if set, otherwise `LLM_BINDING`) must support image inputs. The following providers are vision-capable: `openai`, `azure_openai`, `gemini`, `bedrock`, `ollama`, `anthropic`. `lollms` is rejected at startup because it cannot accept image inputs.
+`VLM_PROCESS_ENABLE` governs image/drawing analysis only; tables and equations are analyzed by the `EXTRACT` role whatever its value. It is not a skip switch: when a document has the `i` option and contains an image that passes the pre-filters, `VLM_PROCESS_ENABLE=false` or an unavailable VLM role fails that document rather than skipping the image (see [Failure versus skip](FileProcessingPipeline.md#43-failure-versus-skip)). When `true`, the effective VLM binding (`VLM_LLM_BINDING` if set, otherwise `LLM_BINDING`) must support image inputs. The following providers are vision-capable: `openai`, `openai_responses`, `azure_openai`, `gemini`, `bedrock`, `ollama`, `anthropic`. `lollms` is rejected at startup because it cannot accept image inputs.
 
 ### 6. Bedrock Role-Level SigV4 Credentials
 
@@ -374,3 +386,4 @@ Do not set `QUERY_LLM_BINDING_API_KEY`; Bedrock rejects that configuration.
 - Gemini Vertex AI mode is controlled by process-level Google environment variables. In the same LightRAG process, some roles cannot use Vertex AI while others use AI Studio API keys.
 - In Docker/Compose, `LLM_BINDING_HOST` usually needs to use a container-reachable address such as `host.docker.internal`; role-level hosts follow the same principle.
 - Restart LightRAG Server after modifying `.env`. Some IDE terminals preload `.env`, so opening a new terminal session is recommended to confirm that environment variables take effect.
+- A thinking-capable Ollama model can silently return empty entities/relations during extraction when its whole generation budget goes to hidden reasoning before any output (issue #3597). If that happens, set `EXTRACT_OLLAMA_LLM_THINK=false` (and `KEYWORD_OLLAMA_LLM_THINK=false` if keyword extraction is affected too). Besides `true`/`false`, this option accepts a reasoning level (`low`/`medium`/`high`, requires an Ollama server that supports levels). Leaving it unset follows the model's own default; an empty value (`OLLAMA_LLM_THINK=`) means `false`, not unset.

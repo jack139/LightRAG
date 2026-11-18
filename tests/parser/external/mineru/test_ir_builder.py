@@ -3,18 +3,61 @@
 from __future__ import annotations
 
 import json
+import logging
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
+from lightrag.chunker.paragraph_semantic import chunking_by_paragraph_semantic
 from lightrag.parser.external.mineru import MinerUIRBuilder
+from lightrag.sidecar.writer import write_sidecar
+from lightrag.utils import Tokenizer, TokenizerInterface
+from lightrag.utils import logger as lightrag_logger
+from tests._log_capture import capture_lightrag_logs
+
+
+class _CharTokenizer(TokenizerInterface):
+    """1:1 character-to-token mapping; no tiktoken download."""
+
+    def encode(self, content: str) -> list[int]:
+        return [ord(ch) for ch in content]
+
+    def decode(self, tokens: list[int]) -> str:
+        return "".join(chr(t) for t in tokens)
+
+
+@contextmanager
+def _captured_logs(caplog, level):
+    """Capture lightrag logger records (see ``tests/_log_capture.py``)."""
+    with capture_lightrag_logs(caplog):
+        with caplog.at_level(level, logger=lightrag_logger.name):
+            yield
+
+
+def _distinct_records(caplog, needle: str, level: int) -> list[logging.LogRecord]:
+    """Records at ``level`` whose message contains ``needle``, deduplicated.
+
+    ``_captured_logs`` routes each record to caplog once, but deduplicating by
+    identity keeps the count honest even if a record ever reaches caplog
+    through a second handler: one ``logger`` call emits ONE ``LogRecord``
+    object, so this counts calls — unlike deduplicating by message, which
+    cannot tell one call from two.
+    """
+    seen: dict[int, logging.LogRecord] = {}
+    for record in caplog.records:
+        if record.levelno == level and needle in record.getMessage():
+            seen.setdefault(id(record), record)
+    return list(seen.values())
 
 
 def _write_bundle(tmp_path: Path, content_list: list[dict]) -> Path:
     """Build a minimal *.mineru_raw/ directory."""
     raw = tmp_path / "doc.mineru_raw"
     raw.mkdir()
-    (raw / "content_list.json").write_text(json.dumps(content_list, ensure_ascii=False))
+    (raw / "content_list.json").write_text(
+        json.dumps(content_list, ensure_ascii=False), encoding="utf-8"
+    )
     return raw
 
 
@@ -360,6 +403,78 @@ def test_adapter_each_heading_starts_its_own_block(tmp_path: Path) -> None:
 
 
 @pytest.mark.offline
+@pytest.mark.parametrize(
+    ("headings", "expected_parents"),
+    [
+        # No level 1 (no detected doc_title): siblings, not parents.
+        (
+            [("Intro", 2), ("Methods", 2), ("Results", 2)],
+            [[], [], []],
+        ),
+        # Skipped level: C2 is C1's sibling, B pops both level-3 headings.
+        (
+            [("A", 1), ("C1", 3), ("C2", 3), ("B", 2), ("B-sub", 3)],
+            [[], ["A"], ["A"], ["A"], ["A", "B"]],
+        ),
+    ],
+)
+def test_adapter_parent_headings_are_ancestors_when_levels_skip(
+    tmp_path: Path,
+    headings: list[tuple[str, int]],
+    expected_parents: list[list[str]],
+) -> None:
+    """``parent_headings`` lists only strictly shallower headings, even when
+    the document starts below level 1 or skips a level."""
+    content_list = []
+    for title, level in headings:
+        content_list += [
+            {"type": "text", "text": title, "text_level": level},
+            {"type": "text", "text": f"{title} body"},
+        ]
+    raw = _write_bundle(tmp_path, content_list)
+    ir = MinerUIRBuilder().normalize_from_workdir(raw, document_name="m.pdf")
+
+    assert [b.heading for b in ir.blocks] == [t for t, _ in headings]
+    assert [b.parent_headings for b in ir.blocks] == expected_parents
+
+
+@pytest.mark.offline
+@pytest.mark.parametrize("level", [1, 2])
+def test_adapter_sibling_sections_chunk_the_same_at_any_start_level(
+    tmp_path: Path, level: int
+) -> None:
+    """End to end: sidecar → P chunker. Siblings starting at level 2 must
+    share a parent path and merge exactly like siblings starting at level 1."""
+    raw = _write_bundle(
+        tmp_path,
+        [
+            item
+            for title in ("Intro", "Methods", "Results")
+            for item in (
+                {"type": "text", "text": title, "text_level": level},
+                {"type": "text", "text": f"{title} body"},
+            )
+        ],
+    )
+    ir = MinerUIRBuilder().normalize_from_workdir(raw, document_name="m.pdf")
+    parsed = write_sidecar(
+        ir,
+        parsed_dir=tmp_path / "doc.parsed",
+        doc_id="doc-" + "0" * 32,
+        engine="mineru",
+    )
+    chunks = chunking_by_paragraph_semantic(
+        Tokenizer("char", _CharTokenizer()),
+        parsed["content"],
+        600,
+        blocks_path=parsed["blocks_path"],
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0]["heading"]["parent_headings"] == []
+
+
+@pytest.mark.offline
 def test_adapter_heading_markdown_prefix_cap_and_existing_marker(
     tmp_path: Path,
 ) -> None:
@@ -516,6 +631,129 @@ def test_adapter_empty_table_dropped(tmp_path: Path) -> None:
     joined = "\n".join(b.content_template for b in ir.blocks)
     assert "TBL:" not in joined
     assert "kept" in joined
+
+
+@pytest.mark.offline
+def test_adapter_logs_structural_item_dropped_without_text(
+    tmp_path: Path, caplog
+) -> None:
+    """An item the dispatch does not know and that carries no usable text is
+    lost without a trace — that is how the dropped ``chart`` items stayed
+    invisible. Leave a debug breadcrumb for those, but not for text-typed
+    items whose emptiness is ordinary layout noise.
+
+    The breadcrumb carries ``self_ref`` and the item's key set: the type alone
+    does not identify which item to look at, nor what payload shape the
+    dispatch failed to map.
+    """
+    raw = _write_bundle(
+        tmp_path,
+        [
+            # Picture-like type the dispatch does not handle: worth a log line.
+            {"type": "header_image", "img_path": "images/logo.png", "page_idx": 3},
+            # Blank running head: expected to be empty, must stay silent.
+            {"type": "header", "text": "", "page_idx": 3},
+        ],
+    )
+    with _captured_logs(caplog, logging.DEBUG):
+        MinerUIRBuilder().normalize_from_workdir(raw, document_name="h.pdf")
+
+    records = _distinct_records(caplog, "no usable text", logging.DEBUG)
+    assert len(records) == 1
+    assert records[0].getMessage() == (
+        "[mineru_ir_builder] 'h.pdf': dropping item with no usable text "
+        "(type=header_image, page_idx=3, self_ref=content_list.json#/0, "
+        "keys=['img_path', 'page_idx', 'type'])"
+    )
+
+
+@pytest.mark.offline
+def test_adapter_warns_once_per_document_about_dropped_items(
+    tmp_path: Path, caplog
+) -> None:
+    """The per-item breadcrumb is DEBUG, which a deployment running at INFO
+    never sees. One WARNING per document names the types that went missing, so
+    the loss is visible on the first ingest instead of after a manual audit.
+
+    It names the document: parse workers run concurrently and no log formatter
+    supplies per-document context, so a bare type/count line in an interleaved
+    batch cannot be attributed to an input file.
+    """
+    raw = _write_bundle(
+        tmp_path,
+        [
+            {"type": "header_image", "img_path": "images/a.png", "page_idx": 1},
+            {"type": "header_image", "img_path": "images/b.png", "page_idx": 2},
+            # Neither ``type`` nor ``label``: renders as ``<untyped>``.
+            {"img_path": "images/c.png", "page_idx": 2},
+            # Layout noise on both counts: must not be counted nor logged.
+            {"type": "header", "text": "", "page_idx": 1},
+            {"type": "text", "text": "Kept body.", "page_idx": 1},
+        ],
+    )
+    with _captured_logs(caplog, logging.DEBUG):
+        ir = MinerUIRBuilder().normalize_from_workdir(raw, document_name="w.pdf")
+
+    records = _distinct_records(caplog, "item(s) dropped", logging.WARNING)
+    assert len(records) == 1
+    assert records[0].getMessage() == (
+        "[mineru_ir_builder] 'w.pdf': 3 content_list item(s) dropped with no "
+        "usable text: <untyped>=1, header_image=2"
+    )
+    # The warning is a report, not a behaviour change: the body still carries
+    # the text item and nothing else entered the IR.
+    assert "Kept body." in "\n".join(b.content_template for b in ir.blocks)
+
+
+@pytest.mark.offline
+def test_adapter_no_warning_when_nothing_dropped(tmp_path: Path, caplog) -> None:
+    """A document whose items the dispatch handles must stay silent — a
+    per-document warning that fires on ordinary input is noise an operator
+    learns to ignore.
+    """
+    raw = _write_bundle(
+        tmp_path,
+        [
+            {"type": "text", "text": "Title", "text_level": 1},
+            {"type": "text", "text": "Body."},
+            {"type": "image", "img_path": "images/x.png", "page_idx": 1},
+            # Empty text-typed items: known layout noise, not a drop to report.
+            {"type": "header", "text": "", "page_idx": 1},
+            {"type": "page_number", "text": "12", "page_idx": 1},
+        ],
+    )
+    with _captured_logs(caplog, logging.DEBUG):
+        MinerUIRBuilder().normalize_from_workdir(raw, document_name="q.pdf")
+
+    assert _distinct_records(caplog, "dropped", logging.WARNING) == []
+    assert _distinct_records(caplog, "no usable text", logging.DEBUG) == []
+
+
+@pytest.mark.offline
+def test_adapter_logs_empty_equation_dropped(tmp_path: Path, caplog) -> None:
+    """An empty ``equation`` is dropped by its own branch so it never reaches
+    the sidecar. That drop was the one silent hole left: the empty-table branch
+    logs, the text fallback logs, this one did not.
+    """
+    raw = _write_bundle(
+        tmp_path,
+        [
+            {"type": "text", "text": "Body."},
+            {"type": "equation", "text": "   ", "page_idx": 4},
+        ],
+    )
+    with _captured_logs(caplog, logging.DEBUG):
+        ir = MinerUIRBuilder().normalize_from_workdir(raw, document_name="e.pdf")
+
+    records = _distinct_records(caplog, "empty equation", logging.DEBUG)
+    assert len(records) == 1
+    assert records[0].getMessage() == (
+        "[mineru_ir_builder] 'e.pdf': dropping empty equation item "
+        "(page_idx=4, self_ref=content_list.json#/1)"
+    )
+    # A local drop of a known type stays out of the per-document summary.
+    assert _distinct_records(caplog, "item(s) dropped", logging.WARNING) == []
+    assert sum(len(b.equations) for b in ir.blocks) == 0
 
 
 @pytest.mark.offline
@@ -799,6 +1037,164 @@ def test_adapter_drawing_asset_source_only_when_file_exists(
 
 
 @pytest.mark.offline
+def test_adapter_chart_item_becomes_drawing(tmp_path: Path) -> None:
+    """MinerU emits ``chart`` items (diagrams, plots, oscillograms) with
+    ``img_path`` + ``chart_caption`` / ``chart_footnote`` and an often empty
+    ``content``. They must become drawings like ``image`` items — otherwise
+    the text fallback silently drops picture, caption and footnote.
+    """
+    raw = _write_bundle(
+        tmp_path,
+        [
+            {
+                "type": "chart",
+                "img_path": "images/chart_001.jpg",
+                "content": "",
+                "chart_caption": ["Abbildung 3-58"],
+                "chart_footnote": [],
+                "bbox": [57, 621, 318, 762],
+                "page_idx": 125,
+            },
+            {
+                "type": "chart",
+                "img_path": "images/chart_002.jpg",
+                "content": "",
+                "chart_caption": [],
+                "chart_footnote": ["Abbildung 4-17. Das obere Diagramm …"],
+                "page_idx": 166,
+            },
+        ],
+    )
+    (raw / "images").mkdir()
+    (raw / "images" / "chart_001.jpg").write_bytes(b"\xff\xd8\xffJPG")
+
+    ir = MinerUIRBuilder().normalize_from_workdir(raw, document_name="c.pdf")
+
+    drawings = [d for b in ir.blocks for d in b.drawings]
+    assert len(drawings) == 2
+    assert drawings[0].asset_ref == "images/chart_001.jpg"
+    assert drawings[0].fmt == "jpg"
+    assert drawings[0].caption == "Abbildung 3-58"
+    assert drawings[0].self_ref == "content_list.json#/0"
+    assert drawings[1].footnotes == ["Abbildung 4-17. Das obere Diagramm …"]
+
+    # Placeholders are emitted into the block body like for images.
+    body = "\n".join(b.content_template for b in ir.blocks)
+    assert f"{{{{IMG:{drawings[0].placeholder_key}}}}}" in body
+
+    # Both charts are declared as assets; bytes are attached when on disk.
+    by_ref = {a.ref: a for a in ir.assets}
+    assert by_ref["images/chart_001.jpg"].source is not None
+    assert by_ref["images/chart_002.jpg"].source is None
+
+
+@pytest.mark.offline
+def test_adapter_drawing_body_content_kept_next_to_placeholder(
+    tmp_path: Path,
+) -> None:
+    """MinerU fills ``content`` on ``chart`` / ``image`` items whenever the
+    model recognised the picture's data (e.g. a chart's data table). That
+    text must stay in the block body next to the ``{{IMG:k}}`` placeholder —
+    it is the only retrievable form of it when no VLM analysis runs.
+    """
+    raw = _write_bundle(
+        tmp_path,
+        [
+            {"type": "text", "text": "Results", "text_level": 1},
+            {
+                "type": "chart",
+                "img_path": "images/c1.jpg",
+                "content": "| year | value |\n|---|---|\n| 2024 | 42 |",
+                "chart_caption": ["Abb. 3-58"],
+                "chart_footnote": ["src: X"],
+            },
+            {
+                "type": "image",
+                "img_path": "images/i1.jpg",
+                "content": "OCR'd label text",
+            },
+        ],
+    )
+    ir = MinerUIRBuilder().normalize_from_workdir(raw, document_name="c.pdf")
+
+    block = ir.blocks[0]
+    chart, image = block.drawings
+    assert block.content_template == (
+        "# Results\n"
+        f"{{{{IMG:{chart.placeholder_key}}}}}\n"
+        "| year | value |\n|---|---|\n| 2024 | 42 |\n"
+        f"{{{{IMG:{image.placeholder_key}}}}}\n"
+        "OCR'd label text"
+    )
+    # Caption / footnote still travel on the drawing, not in the body text.
+    assert chart.caption == "Abb. 3-58"
+    assert chart.footnotes == ["src: X"]
+
+
+@pytest.mark.offline
+def test_adapter_drawing_body_text_read_from_all_payload_keys(
+    tmp_path: Path,
+) -> None:
+    """The picture body must be read the way the text fallback used to read
+    it (``_coerce_text``), not from ``content`` alone. MinerU puts that text
+    under ``text`` or ``body`` as well; before charts had their own branch the
+    fallback surfaced it, so reading one key only would drop it.
+    """
+    raw = _write_bundle(
+        tmp_path,
+        [
+            {
+                "type": "chart",
+                "img_path": "images/c1.jpg",
+                "text": "chart data table: 2024 = 42",
+            },
+            {
+                "type": "chart",
+                "img_path": "images/c2.jpg",
+                "body": "oscillogram legend",
+            },
+        ],
+    )
+    ir = MinerUIRBuilder().normalize_from_workdir(raw, document_name="c.pdf")
+
+    chart_a, chart_b = ir.blocks[0].drawings
+    assert ir.blocks[0].content_template == (
+        f"{{{{IMG:{chart_a.placeholder_key}}}}}\n"
+        "chart data table: 2024 = 42\n"
+        f"{{{{IMG:{chart_b.placeholder_key}}}}}\n"
+        "oscillogram legend"
+    )
+
+
+@pytest.mark.offline
+def test_adapter_drawing_non_string_body_never_enters_block_text(
+    tmp_path: Path,
+) -> None:
+    """A non-string ``content`` (MinerU's v2 content_list nests the path under
+    ``content.image_source.path``) must NOT reach the block body: it would be
+    ``str()``-ed into a Python repr that then gets chunked, embedded and
+    returned by retrieval. ``_coerce_text``'s ``isinstance`` guard is what
+    keeps it out.
+    """
+    raw = _write_bundle(
+        tmp_path,
+        [
+            {
+                "type": "chart",
+                "img_path": "images/a.png",
+                "content": {"image_source": {"path": "images/a.png"}},
+            },
+        ],
+    )
+    ir = MinerUIRBuilder().normalize_from_workdir(raw, document_name="c.pdf")
+
+    drawing = ir.blocks[0].drawings[0]
+    body = ir.blocks[0].content_template
+    assert body == f"{{{{IMG:{drawing.placeholder_key}}}}}"
+    assert "image_source" not in body
+
+
+@pytest.mark.offline
 def test_adapter_refuses_path_traversal_img_path(tmp_path: Path) -> None:
     """Untrusted img_path with ``..`` or absolute filesystem segments must
     not be allowed to point ``AssetSpec.source`` outside ``raw_dir``.
@@ -828,6 +1224,38 @@ def test_adapter_refuses_path_traversal_img_path(tmp_path: Path) -> None:
     # (and crucially must not point at the original secret file).
     abs_asset = by_ref[str(secret)]
     assert abs_asset.source is None
+
+
+@pytest.mark.offline
+@pytest.mark.parametrize(
+    "img_path", ["..fig.png", "...fig.png", "..assets/fig.png", "images/..fig.png"]
+)
+def test_adapter_resolves_dot_prefixed_img_path_inside_raw_dir(
+    tmp_path: Path, img_path: str
+) -> None:
+    """A name that merely starts with two dots is not a parent reference: the
+    image inside ``raw_dir`` must be found, not dropped as unsafe."""
+    raw = _write_bundle(tmp_path, [{"type": "image", "img_path": img_path}])
+    image = raw / img_path
+    image.parent.mkdir(parents=True, exist_ok=True)
+    image.write_bytes(b"png")
+
+    ir = MinerUIRBuilder().normalize_from_workdir(raw, document_name="x.pdf")
+
+    assert ir.assets[0].source == image.resolve()
+
+
+@pytest.mark.offline
+@pytest.mark.parametrize("img_path", ["..", "../secret.png", "images/../../secret.png"])
+def test_adapter_refuses_parent_component_img_path(
+    tmp_path: Path, img_path: str
+) -> None:
+    (tmp_path / "secret.png").write_bytes(b"private")
+    raw = _write_bundle(tmp_path, [{"type": "image", "img_path": img_path}])
+
+    ir = MinerUIRBuilder().normalize_from_workdir(raw, document_name="x.pdf")
+
+    assert ir.assets[0].source is None
 
 
 @pytest.mark.offline

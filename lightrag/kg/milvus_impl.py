@@ -1,21 +1,37 @@
 import asyncio
 import json
+import math
 import os
+import re
+import threading
 import time
-from typing import Any, final, Optional, Dict
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Awaitable, Callable, Collection, final, Optional, Dict
 from dataclasses import dataclass, fields
 import numpy as np
 from lightrag.utils import (
     logger,
+    bounded_submit,
     compute_mdhash_id,
+    get_loop_semaphore,
     _cooperative_yield,
+    _bounded_submit_impl,
+    _consume_future_exception,
+    _wait_deferring_cancellation,
     validate_workspace,
+    validate_workspace_override,
 )
 from ..base import BaseVectorStorage
 from ..constants import (
     DEFAULT_MAX_FILE_PATH_LENGTH,
     DEFAULT_QUERY_PRIORITY,
     GRAPH_FIELD_SEP,
+    MILVUS_SUBMIT_LIMIT,
+)
+from ..exceptions import (
+    StorageCapabilityError,
+    StorageControlPlaneError,
+    VectorSpaceMismatchError,
 )
 from ..kg.shared_storage import get_data_init_lock, get_namespace_lock
 import pipmaster as pm
@@ -36,6 +52,256 @@ from packaging import version
 
 config = configparser.ConfigParser()
 config.read("config.ini", "utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Blocking gRPC off the event loop
+# ---------------------------------------------------------------------------
+#
+# MilvusClient is a synchronous SDK: `search`, `upsert`, `delete` and
+# `load_collection` all block until the server answers. Awaited inline from an
+# `async def`, they hold the only thread serving HTTP for the whole round trip,
+# and these round trips are not uniformly short -- a 64MB upsert batch, or a
+# cold `load_collection` (pymilvus polls until the collection is loaded), is
+# seconds rather than milliseconds.
+#
+# Not the default executor (`asyncio.to_thread`): that pool is
+# `min(32, cpu + 4)` workers with an unbounded wait queue, and it is shared with
+# `UnifiedLock._acquire_mp_lock_in_executor`, login password hashing and the
+# document routes' `stat()` calls. Parking Milvus round trips there makes every
+# `pipeline_status` / namespace lock acquisition under gunicorn -- and every
+# login -- queue behind them, which is why `get_storage_io_executor` and
+# `get_chunking_executor` carry the same warning.
+#
+# Not `run_in_storage_io` either: that pool has a single worker, which would
+# serialize every search in the process behind one flush.
+#
+# Invariants for anything submitted here:
+#   * no nested submission -- a submitted callable must not submit again;
+#   * synchronous SDK calls only: awaiting a coroutine from the worker would
+#     park it on the loop while the loop waits for the worker;
+#   * no re-entry into the storage layer, which takes `NamespaceLock` -- the
+#     caller already holds it and it is not reentrant. The pool therefore holds
+#     no locks and cannot take part in a cycle.
+
+_MILVUS_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_MILVUS_EXECUTOR_GUARD = threading.Lock()
+
+
+def get_milvus_executor() -> ThreadPoolExecutor:
+    """The process-wide pool used for blocking MilvusClient calls."""
+    global _MILVUS_EXECUTOR
+    if _MILVUS_EXECUTOR is None:
+        with _MILVUS_EXECUTOR_GUARD:
+            if _MILVUS_EXECUTOR is None:
+                _MILVUS_EXECUTOR = ThreadPoolExecutor(
+                    max_workers=MILVUS_SUBMIT_LIMIT,
+                    thread_name_prefix="lightrag-milvus",
+                )
+    return _MILVUS_EXECUTOR
+
+
+async def run_in_milvus_executor(
+    fn: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    """Run one blocking MilvusClient call off the event loop thread.
+
+    Cancellation behaves exactly as `asyncio.to_thread` does: cancelling the
+    caller releases the awaiter while the call itself runs to completion in the
+    pool. Callers that must not return before the call has landed keep their own
+    deferral (see `_flush_pending_vector_ops`).
+
+    Accepted residue: the semaphore is per event loop (it has to be --
+    `asyncio.Semaphore` binds to the first loop that waits on it, see
+    `get_loop_semaphore`) while the executor is per process, so N concurrently
+    active loops in one process could have N * MILVUS_SUBMIT_LIMIT submissions
+    outstanding. That bounds nothing worse than queue depth: concurrent Milvus
+    round trips stay capped at the pool width process-wide, because a blocking
+    SDK call in flight IS an occupied worker and `ThreadPoolExecutor` never
+    starts more than `max_workers` of them; and a queued submission holds only
+    arguments its awaiting caller already keeps alive, so the queue duplicates
+    no memory. The deployment shape has one active loop per process anyway
+    (gunicorn forks a worker per loop, each with its own gRPC channel), and the
+    three sibling pools carry the identical per-loop/per-process split.
+    """
+    semaphore = get_loop_semaphore("milvus", MILVUS_SUBMIT_LIMIT)
+    return await bounded_submit(get_milvus_executor(), semaphore, fn, *args, **kwargs)
+
+
+async def run_in_milvus_executor_uninterruptible(
+    fn: Callable[..., Any],
+    args: tuple[Any, ...] = (),
+    kwargs: Optional[dict[str, Any]] = None,
+    *,
+    on_committed: Optional[Callable[[], Awaitable[Any]]] = None,
+) -> Any:
+    """Run one blocking MilvusClient call that the CALLER must not outlive.
+
+    `run_in_milvus_executor` lets a cancelled caller return while the thread
+    runs on. That is right for a read, and wrong wherever the caller holds
+    something the thread's work depends on -- `_flush_lock`, a closed reader
+    gate, the `destructive_busy` reservation its own caller took. Releasing
+    those while the SDK call is still in flight lets a writer land a row that
+    the still-running call then erases.
+
+    Deferring the caller's cancellation is not enough by itself, because a
+    cancellation can arrive at the awaiting task DIRECTLY -- a shutdown that
+    cancels every pending task does exactly that. `_bounded_submit_impl`'s
+    loop-and-shield holds through repeated cancellation and returns only once
+    the executor future is done, which is what makes the hold real rather than
+    nominal. The withheld cancellation is re-raised afterwards, stamped, so a
+    caller that rewrites it is never told the write did not happen.
+
+    `on_committed` is bookkeeping that must not be separated from a call that
+    landed (pruning a buffer the delete just made stale). It runs inside the
+    same uncancellable region, and only if the call actually succeeded.
+
+    Takes `args` / `kwargs` as containers rather than `*args, **kwargs`, for
+    the reason `_bounded_submit_impl` states: a control keyword on the
+    signature would otherwise collide with an argument meant for `fn`.
+    """
+    semaphore = get_loop_semaphore("milvus", MILVUS_SUBMIT_LIMIT)
+    return await _bounded_submit_impl(
+        get_milvus_executor(),
+        semaphore,
+        fn,
+        args,
+        kwargs or {},
+        wait_for_completion=True,
+        on_committed=on_committed,
+    )
+
+
+# "The collection exists" flag, keyed by (running loop, collection).
+#
+# By COLLECTION rather than by instance, like the writer lock
+# (`get_namespace_lock(namespace=final_namespace)`): several
+# MilvusVectorDBStorage objects can resolve to the SAME collection -- two
+# LightRAG instances, or distinct workspaces collapsed by the MILVUS_WORKSPACE
+# override -- and a drop through one of them must gate the readers of all of
+# them.
+#
+# By LOOP because `asyncio.Event` is loop-bound in fact if not in signature:
+# `wait()` on a SET event returns without touching the loop, but one that
+# actually blocks binds the event, `set()` from elsewhere is not thread-safe,
+# and a later loop blocking on it raises "bound to a different event loop".
+# Sharing one event across loops would therefore trade a read that fails during
+# a clear for a hang or a spurious error -- the mirror of the residue, not an
+# improvement on it. `get_loop_semaphore` keys the submit semaphore the same
+# way and for the same reason.
+#
+# So a drop on one loop does not gate readers on another loop in the same
+# process, exactly as it does not gate other processes. What those readers get
+# is on `_run_gated`. The deployment shape is one active loop per process
+# anyway (gunicorn forks a worker per loop), which is what
+# `run_in_milvus_executor` says about its own per-loop/per-process split.
+
+
+class _CollectionGate:
+    """Reader lease and drop barrier for one collection on one event loop.
+
+    Two halves, and the pair is what makes the guarantee: readers hold a LEASE
+    across each blocking SDK call, and a rebuild first CLOSES the gate (no new
+    lease is granted) and then waits for the outstanding leases to drain. A
+    flag alone cannot do it -- between a reader checking the flag and its call
+    reaching a pool thread, a rebuild can remove the collection underneath it.
+
+    The lease spans one submission, never a whole method: it covers the wait
+    for a pool permit and the SDK round trip, and nothing else. That bound is
+    the whole reason this is affordable -- a rebuild never waits for an
+    embedding round trip a reader happens to be sitting in between two of its
+    calls, which is what makes a drain viable on a destructive path at all.
+
+    It is NOT only the calls executing against the server, though: a read that
+    has a lease but is still queued for one of the ``MILVUS_SUBMIT_LIMIT``
+    permits holds it too, so a rebuild also waits out the backlog standing at
+    the moment the gate closed. Bounded and non-growing -- the closed gate
+    admits no new reader, and the backlog drains at full pool width -- but on a
+    saturated pool that is several round trips, not one. Counting only
+    submitted work would mean learning from ``bounded_submit`` when it hands a
+    call to a thread, and it deliberately declares no keyword arguments of its
+    own; that seam would have to be cut in ``lightrag/utils.py``, for every
+    pool that shares it.
+
+    ``acquire_read`` takes the lease and then RE-CHECKS the gate, handing it
+    back if a rebuild closed it in between. Both steps run without an await
+    between them, so a rebuild sees either the lease (and waits for it) or a
+    reader that has backed off -- never a lease it missed.
+    """
+
+    def __init__(self) -> None:
+        self._open = asyncio.Event()
+        self._open.set()
+        self._idle = asyncio.Event()
+        self._idle.set()
+        self._leases = 0
+
+    def is_open(self) -> bool:
+        return self._open.is_set()
+
+    async def acquire_read(self) -> None:
+        while True:
+            await self._open.wait()
+            self._leases += 1
+            self._idle.clear()
+            if self._open.is_set():
+                return
+            self.release_read()
+
+    def release_read(self) -> None:
+        self._leases -= 1
+        if self._leases <= 0:
+            self._idle.set()
+
+    def close(self) -> None:
+        """Refuse new leases. Call ``reopen`` from a ``finally``."""
+        self._open.clear()
+
+    async def wait_idle(self) -> None:
+        """Wait for the in-flight reads to finish. Bounded by their round trips."""
+        await self._idle.wait()
+
+    def reopen(self) -> None:
+        self._open.set()
+
+
+_COLLECTION_GATES: dict[int, tuple[Any, dict[str, _CollectionGate]]] = {}
+# Ownership marker written into a collection's schema description, and the
+# shape of a model collection's name with its in-place-migration backups. See
+# ``MilvusVectorDBStorage.drop_sibling_models``.
+_OWNERSHIP_MARKER_PREFIX = "[lightrag:"
+_SIBLING_COLLECTION_RE = re.compile(r"_\d+d(_temp|_old)?$")
+
+_COLLECTION_GATES_GUARD = threading.Lock()
+
+
+def get_collection_gate(final_namespace: str) -> _CollectionGate:
+    """The running loop's reader gate for one Milvus collection, open when idle.
+
+    Must be called from inside the loop that will await it -- never cached on
+    an instance, which outlives any one loop (successive ``asyncio.run()``
+    calls on the same ``LightRAG`` object are the ordinary way that happens).
+
+    The entry holds a strong reference to the loop on purpose: an event that
+    never had to block never learns which loop it belongs to, so there would be
+    nothing to test ``is_closed()`` on and no way to detect ``id()`` reuse.
+    Closed loops are swept on the next call, same as ``_fallback_semaphore``.
+    """
+    loop = asyncio.get_running_loop()
+    with _COLLECTION_GATES_GUARD:
+        for stale_key, (stale_loop, _) in list(_COLLECTION_GATES.items()):
+            if stale_loop.is_closed():
+                _COLLECTION_GATES.pop(stale_key, None)
+        key = id(loop)
+        entry = _COLLECTION_GATES.get(key)
+        if entry is None or entry[0] is not loop:
+            entry = (loop, {})
+            _COLLECTION_GATES[key] = entry
+        gate = entry[1].get(final_namespace)
+        if gate is None:
+            gate = _CollectionGate()
+            entry[1][final_namespace] = gate
+        return gate
 
 
 @dataclass
@@ -60,6 +326,72 @@ DEFAULT_MILVUS_UPSERT_MAX_PAYLOAD_BYTES = (
 )  # 32MB, well below the 64MB gRPC ceiling
 DEFAULT_MILVUS_UPSERT_MAX_RECORDS_PER_BATCH = 128
 DEFAULT_MILVUS_DELETE_MAX_RECORDS_PER_BATCH = 1000
+
+
+# Default MILVUS_LOAD_TIMEOUT. pymilvus' load_collection() without a timeout
+# returns only when the load reaches 100%, and the server does not always end
+# a load that cannot complete, so an unbounded wait can block queries, flushes
+# and startup for good. 600s matches Milvus' own queryCoord.loadTimeoutSeconds
+# default; a deployment whose largest collection needs longer to cold-load
+# raises it, and 0 restores the unbounded wait.
+DEFAULT_MILVUS_LOAD_TIMEOUT_SECONDS = 600.0
+
+
+class MilvusCollectionLoadError(StorageControlPlaneError):
+    """An existing collection could not be loaded (refused, or still loading
+    when MILVUS_LOAD_TIMEOUT expired).
+    """
+
+
+# Read-path response-size ceiling. Unlike the write path above,
+# a query() response that crosses the gRPC message ceiling isn't rejected by
+# self-hosted Milvus's much larger ~64MB limit — it's rejected by the ~4MB
+# gRPC default that managed gateways (e.g. Zilliz Cloud) enforce and don't
+# expose a way to raise. 2MB keeps a 2x margin under that 4MB ceiling.
+MILVUS_QUERY_MAX_RESPONSE_BYTES = 2 * 1024 * 1024  # 2MB
+MILVUS_QUERY_MAX_RECORDS_PER_BATCH = 256
+MILVUS_QUERY_ROW_OVERHEAD_BYTES = 256
+
+# Substrings that mark a query() failure as "the response was too large"
+# rather than a connection or parameter error. Metadata rows carry no
+# estimable size (`content` and `source_id` are each capped only by
+# MILVUS_MAX_VARCHAR_BYTES), so the record cap above cannot be a byte-level
+# guarantee for them; a page that still overflows is bisected and retried
+# instead of failing the whole read. Deriving the metadata page size from
+# those schema limits statically would instead assume ~200KB per row and
+# shrink every page to ~10 ids, inflating the common case (multi-KB
+# `content`) by roughly an order of magnitude for an overflow that is rare.
+#
+# Matched on the message text only, never on the gRPC RESOURCE_EXHAUSTED
+# status: that status also covers per-user quota (grpc's own docs say so), and
+# a rate-limited call bisected into ~log2(page_size) immediate no-backoff
+# retries would amplify the throttling it misread. The status buys no recall
+# either — grpc-core always attaches this text to a genuine oversize response
+# — so quota errors fail fast instead.
+MILVUS_QUERY_RESPONSE_TOO_LARGE_MARKERS = ("received message larger than max",)
+
+# Consistency level for every point read (`query()` by id or by filter).
+# Collections are created without a level, so the server default -- Bounded --
+# applies to any request that does not name one. Bounded serves a snapshot up to
+# `common.gracefulTime` (5 s by default) old, so a row upserted or deleted by
+# the flush that just emptied `_pending_vector_docs` / `_pending_vector_deletes`
+# can be missing from, or still present in, the next read. The write buffer
+# gives read-your-writes only until that flush. Reads whose answer drives a
+# decision or is shown back to the caller -- `delete_entity_relation`'s
+# victim lookup, `is_empty`, `get_by_id(s)`, `get_vectors_by_ids` -- therefore
+# ask for Strong, which waits for the server's time tick (`timeTickInterval`,
+# 200 ms by default) instead of reading a stale snapshot. Passed per request
+# rather than set at creation, so collections created before this change get it
+# too.
+#
+# Accepted residue: vector search (`MilvusVectorDBStorage.query()`, which calls
+# `client.search`) stays on the collection default. A search that misses
+# vectors written moments ago is ordinary retrieval lag, healed by the next
+# search, and Strong would add a time-tick wait to every query. The schema
+# migration's `query_iterator` is also left on its default: it runs inside
+# `initialize()`, before this instance has written anything, so it copies rows
+# an earlier run flushed.
+MILVUS_POINT_READ_CONSISTENCY_LEVEL = "Strong"
 
 # Schema-migration resilience. A transient Milvus outage during the long
 # iterator-based migration must not kill worker startup: when pymilvus'
@@ -175,6 +507,17 @@ def _get_env_int(key: str, default: int) -> int:
                 f"Invalid integer value for {key}: {val}, using default {default}"
             )
     return default
+
+
+def _escape_milvus_str(val: str) -> str:
+    """Escape a value embedded in a double-quoted Milvus filter literal."""
+    return (
+        val.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
 
 
 @dataclass
@@ -496,7 +839,22 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             logger.warning(
                 f"[{self.workspace}] Milvus database '{db_name}' not found, creating it"
             )
-            client.create_database(db_name)
+            try:
+                client.create_database(db_name)
+            except MilvusException as e:
+                # Two or more workers can both see the database missing and race to
+                # create it; the loser must treat "already exists" as
+                # success rather than failing startup. Matching on the
+                # message (not the error code, which isn't consistently
+                # assigned across server versions) avoids a second
+                # list_databases() call, which could itself observe stale
+                # cluster metadata and re-raise despite the create having
+                # actually succeeded.
+                if "already exist" not in str(e).lower():
+                    raise
+                logger.debug(
+                    f"[{self.workspace}] Milvus database '{db_name}' already exists — continuing"
+                )
 
         use_database = getattr(client, "use_database", None) or getattr(
             client, "using_database", None
@@ -690,8 +1048,16 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
         return CollectionSchema(
             fields=all_fields,
-            description=description,
+            description=f"{description} {self._ownership_marker()}",
             enable_dynamic_field=True,  # Support dynamic fields
+        )
+
+    def _ownership_marker(self) -> str:
+        """Schema-description tag naming the workspace and namespace that own a
+        collection; ``drop_sibling_models`` trusts it, never the name alone."""
+        return (
+            f"{_OWNERSHIP_MARKER_PREFIX}workspace={self.workspace};"
+            f"namespace={self.namespace}]"
         )
 
     def _get_varchar_field_limits_for_namespace(self) -> dict[str, int]:
@@ -1146,8 +1512,28 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         logger.debug(f"[{self.workspace}] Field '{field_name}' is compatible")
         return True
 
-    def _check_vector_dimension(self, collection_info: dict):
-        """Check vector dimension compatibility"""
+    def _check_vector_dimension(
+        self, collection_info: dict, container: str | None = None
+    ):
+        """Check vector dimension compatibility.
+
+        Args:
+            collection_info: ``describe_collection`` output for ``container``.
+            container: the collection the info describes. Defaults to
+                ``final_namespace``; the legacy-migration caller passes its own
+                source collection so the refusal names what it actually read.
+
+        Raises:
+            VectorSpaceMismatchError: the collection holds vectors of another
+                dimension. Callers that are merely *sourcing* a migration
+                (the legacy collection) must catch it -- a legacy collection in
+                another embedding space is not a refusal, because the suffixed
+                collection is a different container and is created fresh.
+            ValueError: the dimensions could not be parsed at all, which is a
+                broken schema rather than an embedding-space change and must
+                never reach ``lightrag-rebuild-vdb`` as a droppable condition.
+        """
+        container = container or self.final_namespace
         current_dimension = self.embedding_func.embedding_dim
 
         # Find vector field dimension
@@ -1187,14 +1573,35 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                             f"current={current_dimension} (type={type(current_dimension)}), error={e}"
                         )
                         raise ValueError(
-                            f"Invalid dimension values for collection '{self.final_namespace}': "
+                            f"Invalid dimension values for collection '{container}': "
                             f"existing={existing_dimension}, current={current_dimension}"
                         ) from e
 
-                    if existing_dim_int != current_dim_int:
+                    # A dimension that is MISSING is not an embedding-space
+                    # change. `None != 768` would otherwise raise the typed
+                    # refusal, and `lightrag-rebuild-vdb` answers that by
+                    # DROPPING the collection -- so a malformed describe_collection
+                    # response, or an embedding_func that never declared a
+                    # dimension, would authorise destroying live vectors. A fact
+                    # nobody reported can never be evidence of a mismatch; see
+                    # "Absent evidence never refuses" in
+                    # docs/design/VectorSpaceProvenance.md.
+                    if existing_dim_int is None or current_dim_int is None:
+                        logger.error(
+                            f"[{self.workspace}] Missing dimension: existing={existing_dimension}, "
+                            f"current={current_dimension}"
+                        )
                         raise ValueError(
-                            f"Vector dimension mismatch for collection '{self.final_namespace}': "
-                            f"existing={existing_dim_int}, current={current_dim_int}"
+                            f"Missing dimension values for collection '{container}': "
+                            f"existing={existing_dimension}, current={current_dimension}"
+                        )
+
+                    if existing_dim_int != current_dim_int:
+                        raise VectorSpaceMismatchError(
+                            backend=type(self).__name__,
+                            container=container,
+                            expected_dim=current_dim_int,
+                            stored_dim=existing_dim_int,
                         )
 
                     logger.debug(
@@ -1822,6 +2229,13 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         try:
             self._client.describe_collection(self.final_namespace)
             self._validate_collection_compatibility()
+        except VectorSpaceMismatchError:
+            # Never reframed as a migration failure. The typed refusal is what
+            # `lightrag-rebuild-vdb` matches on to drop and re-provision this
+            # collection; wrapping it in a generic RuntimeError would leave the
+            # operator with no automated way out, which is the defect this
+            # replaces. See docs/design/VectorSpaceProvenance.md.
+            raise
         except Exception as validation_error:
             logger.error(
                 f"[{self.workspace}] CRITICAL ERROR: Collection '{self.namespace}' exists but validation failed!"
@@ -1895,9 +2309,35 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 raise ValueError(f"Collection {self.final_namespace} does not exist")
 
             # Load the collection if it's not already loaded
-            # In Milvus, collections need to be loaded before they can be searched
-            self._client.load_collection(self.final_namespace)
-            # logger.debug(f"[{self.workspace}] Collection {self.namespace} loaded successfully")
+            # In Milvus, collections need to be loaded before they can be searched.
+            # Without a timeout pymilvus waits until the load reaches 100%, so a
+            # load stuck server-side blocks forever; MILVUS_LOAD_TIMEOUT bounds it.
+            load_kwargs = (
+                {} if self._load_timeout is None else {"timeout": self._load_timeout}
+            )
+            load_started = time.monotonic()
+            try:
+                self._client.load_collection(self.final_namespace, **load_kwargs)
+            except Exception as load_error:
+                # Typed (a RuntimeError) so _create_collection_if_not_exist
+                # re-raises it as-is instead of routing it to the force-create
+                # fallback, whose generic refusal would hide the cause.
+                # Name the knob only when the limit is what ended the wait,
+                # judged by the clock rather than by pymilvus' error text.
+                timeout_hint = ""
+                if (
+                    self._load_timeout is not None
+                    and time.monotonic() - load_started >= self._load_timeout
+                ):
+                    timeout_hint = (
+                        f" (gave up after MILVUS_LOAD_TIMEOUT={self._load_timeout:g}s;"
+                        " raise it if this collection needs longer to load,"
+                        " 0 disables the limit)"
+                    )
+                raise MilvusCollectionLoadError(
+                    f"Failed to load Milvus collection '{self.final_namespace}': "
+                    f"{load_error}{timeout_hint}"
+                ) from load_error
 
         except Exception as e:
             logger.error(
@@ -1967,8 +2407,15 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     )
                 else:
                     try:
-                        self._check_vector_dimension(legacy_collection_info)
-                    except ValueError as legacy_error:
+                        self._check_vector_dimension(
+                            legacy_collection_info, container=self.legacy_namespace
+                        )
+                    # VectorSpaceMismatchError is caught here, not propagated:
+                    # the suffixed collection does not exist yet, so nothing is
+                    # being served out of the wrong embedding space. The legacy
+                    # collection is only a migration SOURCE, and an incompatible
+                    # source simply is not migrated.
+                    except (ValueError, VectorSpaceMismatchError) as legacy_error:
                         logger.warning(
                             f"[{self.workspace}] Legacy collection '{self.legacy_namespace}' "
                             f"is not compatible with '{self.final_namespace}': {legacy_error}. "
@@ -2014,23 +2461,42 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 f"[{self.workspace}] Error in _create_collection_if_not_exist for {self.namespace}: {e}"
             )
 
-            # If there's any error (other than validation failure), try to force create the collection
+            # If there's any error (other than validation failure), create the
+            # collection only if it is missing and would hide nothing.
+            # Never drop an existing collection here: an unclassified error
+            # (a load the cluster refuses, a transient "server is busy") says
+            # nothing about corruption, and dropping would destroy its
+            # vectors. Nor create one that would hide data: an empty target
+            # permanently shadows an unmigrated legacy collection or an
+            # interrupted migration's _old/_temp. Only create when none of
+            # them exists; if existence cannot be established, fail closed.
+            if self._client.has_collection(self.final_namespace):
+                raise RuntimeError(
+                    f"Collection '{self.final_namespace}' exists but could not be "
+                    f"initialized; refusing to drop and recreate it. Original error: {e}"
+                ) from e
+            shadowed = [
+                name
+                for name in (
+                    self.legacy_namespace
+                    if self.legacy_namespace != self.final_namespace
+                    else None,
+                    f"{self.final_namespace}_old",
+                    f"{self.final_namespace}_temp",
+                )
+                if name and self._client.has_collection(name)
+            ]
+            if shadowed:
+                raise RuntimeError(
+                    f"Collection '{self.final_namespace}' could not be initialized; "
+                    f"refusing to create it over existing data in {shadowed}. "
+                    f"Original error: {e}"
+                ) from e
+
             logger.info(
                 f"[{self.workspace}] Attempting to force create collection {self.namespace}..."
             )
             try:
-                # Try to drop the collection first if it exists in a bad state
-                try:
-                    if self._client.has_collection(self.final_namespace):
-                        logger.info(
-                            f"[{self.workspace}] Dropping potentially corrupted collection {self.namespace}"
-                        )
-                        self._client.drop_collection(self.final_namespace)
-                except Exception as drop_error:
-                    logger.warning(
-                        f"[{self.workspace}] Could not drop collection {self.namespace}: {drop_error}"
-                    )
-
                 # Create fresh collection
                 self._create_collection_with_schema(self.final_namespace)
 
@@ -2092,7 +2558,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         milvus_workspace = os.environ.get("MILVUS_WORKSPACE")
         if milvus_workspace and milvus_workspace.strip():
             # Use environment variable value, overriding the passed workspace parameter
-            effective_workspace = milvus_workspace.strip()
+            effective_workspace = validate_workspace_override(
+                "MILVUS_WORKSPACE", milvus_workspace
+            )
             logger.info(
                 f"Using MILVUS_WORKSPACE environment variable: '{effective_workspace}' (overriding '{self.workspace}/{self.namespace}')"
             )
@@ -2170,6 +2638,22 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             logger.warning(
                 f"MILVUS_DELETE_MAX_RECORDS_PER_BATCH={self._max_delete_records_per_batch} is non-positive, disable delete record-count splitting"
             )
+
+        # Collection-load wait limit in seconds. Unset or blank takes the
+        # default; <= 0 (or inf) means no limit, i.e. load_collection() without
+        # a timeout. A malformed value fails fast rather than silently running
+        # with a limit the operator did not choose.
+        raw_load_timeout = os.getenv("MILVUS_LOAD_TIMEOUT", "").strip()
+        load_timeout = (
+            float(raw_load_timeout)
+            if raw_load_timeout
+            else DEFAULT_MILVUS_LOAD_TIMEOUT_SECONDS
+        )
+        if math.isnan(load_timeout):
+            raise ValueError("MILVUS_LOAD_TIMEOUT must be a number of seconds, got nan")
+        self._load_timeout: float | None = (
+            load_timeout if 0 < load_timeout < math.inf else None
+        )
 
         # Schema-migration retry knobs (see DEFAULT_MILVUS_MIGRATION_*
         # constants). MILVUS_MIGRATION_MAX_RETRIES=0 restores fail-fast.
@@ -2306,6 +2790,69 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 self._pending_vector_deletes.discard(doc_id)
                 self._pending_vector_docs[doc_id] = pdoc
 
+    async def _run_gated(
+        self, fn: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        """Submit one blocking read to the pool, waiting out a drop() first.
+
+        Every reader-side submission goes through this, never bare
+        ``run_in_milvus_executor``: ``query`` / ``_query_rows_by_ids`` /
+        ``get_by_id`` hold no lock over their server legs, so without it a read
+        issued while ``drop()`` has the collection removed fails the request --
+        and ``get_by_id``, whose ``except Exception`` returns ``None``, would
+        report a missing COLLECTION as a missing ROW, the silent failure
+        ``AGENTS.md`` *Consistency without transactions* forbids.
+
+        Gating each submission rather than each method is the point: a reader
+        that passed one check at entry can then sit in an embedding round trip
+        for seconds, and a drop starting in that gap would leave the check
+        behind it worthless.
+
+        The lease, not just the check, is what closes the window. Waiting on a
+        flag and then submitting leaves room for a rebuild to start between the
+        two; holding a lease across the submission makes ``drop()`` wait for
+        this read instead. The wait it costs is bounded by the SDK round trip
+        (plus the pool permit it queues for), never by a reader's embedding
+        work -- see :class:`_CollectionGate`.
+
+        Writers must NOT use this. They run under ``_flush_lock``, which
+        ``drop()`` holds for the whole rebuild, so they are already excluded --
+        and ``drop()`` itself, which closes this gate, would wait on itself.
+
+        Free when no drop is running: the gate is open, so taking the lease
+        costs an ``Event.wait()`` on a set event, which does not suspend.
+
+        What stays open is readers this loop's gate does not reach -- another
+        loop in this process, or another process, where a rebuild really does
+        remove the collection under them. Their reads fail, and each entry
+        point then reports it the way it always has: ``query`` propagates,
+        ``get_by_id`` returns ``None``, ``get_by_ids`` returns ``[]``, and
+        ``get_vectors_by_ids`` returns what it had buffered. Two of those
+        report a missing COLLECTION as missing ROWS, which is why this gate
+        exists; changing that reporting is a separate contract change, not
+        something to slip in here.
+
+        And one more, accepted rather than closed: a reader CANCELLED after
+        submitting (an HTTP timeout, a shutdown) returns from
+        ``run_in_milvus_executor`` at once while its call runs on, so the
+        ``finally`` below hands the lease back and a rebuild can remove the
+        collection under a call still executing. Harmless in the direction
+        that matters -- nothing durable is touched by a read, and the call's
+        result and its error both go nowhere, because the caller that would
+        have received them is already gone. Holding the lease to the thread's
+        actual exit would mean either releasing it from the executor future's
+        completion (the ``bounded_submit`` seam this file does not cut -- see
+        :class:`_CollectionGate`) or submitting reads uninterruptibly, which
+        would make an HTTP timeout wait out a full Milvus round trip before
+        the request could be abandoned. Both cost more than the overlap does.
+        """
+        gate = get_collection_gate(self.final_namespace)
+        await gate.acquire_read()
+        try:
+            return await run_in_milvus_executor(fn, *args, **kwargs)
+        finally:
+            gate.release_read()
+
     async def query(
         self, query: str, top_k: int, query_embedding: list[float] = None
     ) -> list[dict[str, Any]]:
@@ -2314,10 +2861,16 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         Note: buffered-but-unflushed upserts are NOT visible to this method —
         they exist only in `_pending_vector_docs` until `index_done_callback()`
         embeds and writes them. Callers that need read-after-write visibility
-        for similarity search must run an explicit flush first.
+        for similarity search must run an explicit flush first, and even then
+        a search issued right after the flush can still miss those rows: it
+        reads at the collection's default Bounded consistency (see
+        ``MILVUS_POINT_READ_CONSISTENCY_LEVEL`` for why it stays there).
         """
-        # Ensure collection is loaded before querying
-        self._ensure_collection_loaded()
+        # Ensure collection is loaded before querying. MilvusClient is a
+        # synchronous SDK (blocking gRPC calls) -- run it off the event loop
+        # thread so a search doesn't stall every other concurrent task, and off
+        # the SHARED default pool (see get_milvus_executor).
+        await self._run_gated(self._ensure_collection_loaded)
 
         # Use provided embedding or compute it
         if query_embedding is not None:
@@ -2342,7 +2895,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             },
         }
 
-        results = self._client.search(
+        # Re-gated: the embedding round trip above can have taken seconds.
+        results = await self._run_gated(
+            self._client.search,
             collection_name=self.final_namespace,
             data=embedding,
             limit=top_k,
@@ -2458,7 +3013,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 return
 
             # Milvus requires the collection to be loaded before upsert/delete.
-            self._ensure_collection_loaded()
+            # MilvusClient is synchronous (blocking gRPC) -- run it in the Milvus
+            # pool, same reasoning as query()'s search() call.
+            await run_in_milvus_executor(self._ensure_collection_loaded)
 
             pending_docs = self._pending_vector_docs
             pending_deletes = self._pending_vector_deletes
@@ -2525,69 +3082,95 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 for doc_id in committed_ids
             ]
 
-            try:
-                if list_data:
-                    # Split the upsert into batches that stay under the server-side
-                    # 64MB gRPC message limit. Fail-fast: any batch failure raises
-                    # immediately and the full buffer is retained for the next flush.
-                    upsert_batches = self._build_upsert_batches(
-                        list_data,
-                        max_payload_bytes=self._max_upsert_payload_bytes,
-                        max_records_per_batch=self._max_upsert_records_per_batch,
-                    )
-                    if len(upsert_batches) > 1:
-                        logger.info(
-                            f"[{self.workspace}] {self.namespace} flush: upsert split into "
-                            f"{len(upsert_batches)} batches for {len(list_data)} records "
-                            f"(max_payload={self._max_upsert_payload_bytes} batch={self._max_upsert_records_per_batch})"
+            async def _write_and_clear_buffers() -> None:
+                try:
+                    if list_data:
+                        # Split the upsert into batches that stay under the server-side
+                        # 64MB gRPC message limit. Fail-fast: any batch failure raises
+                        # immediately and the full buffer is retained for the next flush.
+                        upsert_batches = self._build_upsert_batches(
+                            list_data,
+                            max_payload_bytes=self._max_upsert_payload_bytes,
+                            max_records_per_batch=self._max_upsert_records_per_batch,
                         )
-                    for batch_index, (records_batch, estimated_bytes) in enumerate(
-                        upsert_batches, 1
-                    ):
-                        if (
-                            len(records_batch) == 1
-                            and self._max_upsert_payload_bytes > 0
-                            and estimated_bytes > self._max_upsert_payload_bytes
-                        ):
-                            logger.warning(
-                                f"[{self.workspace}] {self.namespace} flush: single record "
-                                f"id={records_batch[0].get('id')} estimated {estimated_bytes} bytes "
-                                f"exceeds {self._max_upsert_payload_bytes}"
+                        if len(upsert_batches) > 1:
+                            logger.info(
+                                f"[{self.workspace}] {self.namespace} flush: upsert split into "
+                                f"{len(upsert_batches)} batches for {len(list_data)} records "
+                                f"(max_payload={self._max_upsert_payload_bytes} batch={self._max_upsert_records_per_batch})"
                             )
-                        logger.debug(
-                            f"[{self.workspace}] Milvus upsert batch {batch_index}/{len(upsert_batches)}: "
-                            f"records={len(records_batch)}, estimated_payload_bytes={estimated_bytes}"
+                        for batch_index, (records_batch, estimated_bytes) in enumerate(
+                            upsert_batches, 1
+                        ):
+                            if (
+                                len(records_batch) == 1
+                                and self._max_upsert_payload_bytes > 0
+                                and estimated_bytes > self._max_upsert_payload_bytes
+                            ):
+                                logger.warning(
+                                    f"[{self.workspace}] {self.namespace} flush: single record "
+                                    f"id={records_batch[0].get('id')} estimated {estimated_bytes} bytes "
+                                    f"exceeds {self._max_upsert_payload_bytes}"
+                                )
+                            logger.debug(
+                                f"[{self.workspace}] Milvus upsert batch {batch_index}/{len(upsert_batches)}: "
+                                f"records={len(records_batch)}, estimated_payload_bytes={estimated_bytes}"
+                            )
+                            await run_in_milvus_executor(
+                                self._client.upsert,
+                                collection_name=self.final_namespace,
+                                data=records_batch,
+                            )
+                    if pending_deletes:
+                        # Chunk deletes by record count; pks are short strings so a
+                        # count cap is enough to stay under the gRPC message limit.
+                        delete_ids = list(pending_deletes)
+                        delete_chunk = (
+                            self._max_delete_records_per_batch
+                            if self._max_delete_records_per_batch > 0
+                            else len(delete_ids)
                         )
-                        self._client.upsert(
-                            collection_name=self.final_namespace, data=records_batch
-                        )
-                if pending_deletes:
-                    # Chunk deletes by record count; pks are short strings so a
-                    # count cap is enough to stay under the gRPC message limit.
-                    delete_ids = list(pending_deletes)
-                    delete_chunk = (
-                        self._max_delete_records_per_batch
-                        if self._max_delete_records_per_batch > 0
-                        else len(delete_ids)
+                        for i in range(0, len(delete_ids), delete_chunk):
+                            await run_in_milvus_executor(
+                                self._client.delete,
+                                collection_name=self.final_namespace,
+                                pks=delete_ids[i : i + delete_chunk],
+                            )
+                except Exception as e:
+                    logger.error(
+                        f"[{self.workspace}] Error flushing vector ops "
+                        f"(upserts={len(pending_docs)}, "
+                        f"deletes={len(pending_deletes)}): {e}"
                     )
-                    for i in range(0, len(delete_ids), delete_chunk):
-                        self._client.delete(
-                            collection_name=self.final_namespace,
-                            pks=delete_ids[i : i + delete_chunk],
-                        )
-            except Exception as e:
-                logger.error(
-                    f"[{self.workspace}] Error flushing vector ops "
-                    f"(upserts={len(pending_docs)}, "
-                    f"deletes={len(pending_deletes)}): {e}"
-                )
-                raise
+                    raise
 
-            # On success, clear the buffers in-place so external references
-            # (e.g. drop()) see the cleared state.
-            for doc_id in committed_ids:
-                pending_docs.pop(doc_id, None)
-            pending_deletes.clear()
+                # On success, clear the buffers in-place so external references
+                # (e.g. drop()) see the cleared state.
+                for doc_id in committed_ids:
+                    pending_docs.pop(doc_id, None)
+                pending_deletes.clear()
+
+            # run_in_milvus_executor only cancels the awaiting future, not the
+            # in-flight Milvus call: a bare cancellation here would release
+            # _flush_lock and return to the caller while the write (and the
+            # buffer pop that must follow it) is still running in the
+            # background, letting a concurrent flush interleave with it and
+            # possibly land a stale write. Defer the cancellation until the
+            # write -- and its buffer bookkeeping -- has actually finished,
+            # same idiom as commit_in_storage_io / _finish_deferring_cancellation.
+            write_future = asyncio.ensure_future(_write_and_clear_buffers())
+            write_future.add_done_callback(_consume_future_exception)
+            pending_cancel = await _wait_deferring_cancellation(write_future, None)
+            if pending_cancel is not None:
+                if not write_future.cancelled():
+                    write_exc = write_future.exception()
+                    if write_exc is not None:
+                        logger.error(
+                            f"[{self.workspace}] {self.namespace} flush write "
+                            f"completed while its caller was cancelled: {write_exc}"
+                        )
+                raise pending_cancel
+            write_future.result()
 
     async def delete_entity(self, entity_name: str) -> None:
         """Buffer an entity vector delete by computing its hash ID."""
@@ -2614,6 +3197,13 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             the exception propagates so the caller (``adelete_by_entity``
             in ``utils_graph.py``) can short-circuit before
             ``_persist_graph_updates`` flushes a half-cleaned buffer.
+            Cancellation arriving after the delete is submitted is
+            deferred until the delete and the prune both finish, same
+            idiom as ``_flush_pending_vector_ops`` -- otherwise a bare
+            cancel would release ``_flush_lock`` with the buffer unpruned
+            while the delete keeps running in the background, letting a
+            concurrent flush reinsert a relation the server already
+            deleted.
 
         Semantic note (deferred-buffer ↔ persisted divergence): pruning only
         consults the *current* buffered ``src_id`` / ``tgt_id`` view; we do
@@ -2625,7 +3215,11 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         the pending overwrite is dropped — i.e. the final state can diverge
         from the eager-flush ordering (upsert → flush → delete). Callers
         that require eager-equivalent semantics should call
-        ``index_done_callback()`` before ``delete_entity_relation``.
+        ``index_done_callback()`` before ``delete_entity_relation``. That
+        flush is enough only because the victim lookup reads with
+        ``MILVUS_POINT_READ_CONSISTENCY_LEVEL`` (Strong): under the
+        collection's default Bounded level it could miss the rows the flush
+        just wrote.
         """
 
         def _prune_pending() -> None:
@@ -2644,13 +3238,16 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 _prune_pending()
                 return
 
-            self._ensure_collection_loaded()
+            await run_in_milvus_executor(self._ensure_collection_loaded)
 
-            expr = f'src_id == "{entity_name}" or tgt_id == "{entity_name}"'
-            results = self._client.query(
+            safe_name = _escape_milvus_str(entity_name)
+            expr = f'src_id == "{safe_name}" or tgt_id == "{safe_name}"'
+            results = await run_in_milvus_executor(
+                self._client.query,
                 collection_name=self.final_namespace,
                 filter=expr,
                 output_fields=["id"],
+                consistency_level=MILVUS_POINT_READ_CONSISTENCY_LEVEL,
             )
 
             if not results:
@@ -2663,11 +3260,35 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 return
 
             relation_ids = [item["id"] for item in results]
-            self._client.delete(collection_name=self.final_namespace, pks=relation_ids)
-            # Server-side delete succeeded — safe to prune the pending
-            # buffer so subsequent flushes don't re-upsert the deleted
-            # relations.
-            _prune_pending()
+
+            def _delete_then_prune() -> None:
+                """Delete the rows and prune the buffer they made stale, in ONE
+                worker operation.
+
+                Not the delete with the prune as ``on_committed``: that hook is
+                an ``ensure_future`` task of its own, which an all-tasks
+                shutdown sweep can cancel directly in the window between the
+                delete landing and the hook's first step -- the same shape of
+                hole as an inner task, one layer down. Inside the callable the
+                thread carries both to the end, so nothing can land between
+                them; a delete that raises skips the prune by falling out of
+                this function, which is the ordering the buffer contract wants.
+
+                Mutating the buffer from a pool thread is safe here and only
+                here: every reader and writer of ``_pending_vector_docs`` takes
+                ``_flush_lock``, the caller holds it across this submission,
+                and the submission is uninterruptible, so no one else can
+                touch the dict while this runs.
+                """
+                self._client.delete(
+                    collection_name=self.final_namespace, pks=relation_ids
+                )
+                # Server-side delete succeeded — safe to prune the pending
+                # buffer so subsequent flushes don't re-upsert the deleted
+                # relations.
+                _prune_pending()
+
+            await run_in_milvus_executor_uninterruptible(_delete_then_prune)
             logger.debug(
                 f"[{self.workspace}] Deleted {len(relation_ids)} relations for {entity_name}"
             )
@@ -2686,6 +3307,153 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             f"[{self.workspace}] Buffered delete for {len(ids)} vectors in {self.namespace}"
         )
 
+    @staticmethod
+    def _is_response_too_large_error(error: BaseException) -> bool:
+        """Return True when the error chain says a query() response overflowed.
+
+        Walks __cause__/__context__ like _is_retryable_connection_error,
+        because pymilvus wraps the grpc error in MilvusException and the
+        size text can sit a level down. Connection, schema, parameter and
+        quota errors fall through to False — bisecting those would only
+        re-issue a failure that a smaller page cannot fix, and for a
+        rate-limited call it would re-issue it several times over.
+        """
+        seen: set[int] = set()
+        current: BaseException | None = error
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if any(
+                marker in str(current).lower()
+                for marker in MILVUS_QUERY_RESPONSE_TOO_LARGE_MARKERS
+            ):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    def _resolve_query_page_size(self, *, includes_vector: bool) -> int:
+        """Derive how many ids a single query() page may safely carry.
+
+        Rows carrying a vector dominate response size, so their page is
+        sized from the byte budget at the embedding dimension, capped by the
+        record count. Rows without a vector (``get_by_ids``) have no
+        estimable size here — ``content`` and ``source_id`` are each capped
+        only by MILVUS_MAX_VARCHAR_BYTES — so the record cap is used alone.
+        That cap is a heuristic rather than a byte-level guarantee; a page
+        that still overflows is caught and bisected by
+        ``_query_rows_by_ids``.
+        """
+        if not includes_vector:
+            return MILVUS_QUERY_MAX_RECORDS_PER_BATCH
+
+        embedding_dim = self.embedding_func.embedding_dim
+        if embedding_dim <= 0:
+            return MILVUS_QUERY_MAX_RECORDS_PER_BATCH
+
+        row_bytes = embedding_dim * 4 + MILVUS_QUERY_ROW_OVERHEAD_BYTES
+        page_size = MILVUS_QUERY_MAX_RESPONSE_BYTES // row_bytes
+        return max(1, min(page_size, MILVUS_QUERY_MAX_RECORDS_PER_BATCH))
+
+    async def is_empty(self) -> bool:
+        """Whether this container holds no vectors. See ``BaseVectorStorage``.
+
+        **No ``except`` here, on purpose.** Every other read on this class
+        catches its transport errors and answers with a miss, which is why the
+        startup gate could not use them: an outage and an empty container
+        arrive as the same value. This method is the one that must tell them
+        apart, so a failed read propagates and the gate treats it as "no
+        evidence" rather than as emptiness.
+
+        A pending upsert counts as non-empty; ``_pending_vector_deletes`` is
+        not subtracted, because ``True`` is the only answer here that can
+        refuse a deployment.
+        """
+        async with self._flush_lock:
+            if self._pending_vector_docs:
+                return False
+            if self._client is None:
+                raise StorageCapabilityError(
+                    f"[{self.workspace}] Milvus client is not connected, so "
+                    f"{self.final_namespace} cannot be read for emptiness"
+                )
+
+        await self._run_gated(self._ensure_collection_loaded)
+        # `id != ""` rather than an empty filter: every row carries a non-empty
+        # varchar primary key, so this matches all of them on every pymilvus
+        # version, while an empty `filter` needs a `limit` the older clients
+        # reject.
+        rows = await self._run_gated(
+            self._client.query,
+            collection_name=self.final_namespace,
+            filter='id != ""',
+            output_fields=["id"],
+            limit=1,
+            consistency_level=MILVUS_POINT_READ_CONSISTENCY_LEVEL,
+        )
+        return not rows
+
+    async def _query_rows_by_ids(
+        self,
+        ids: list[str],
+        output_fields: list[str],
+        *,
+        includes_vector: bool,
+    ) -> list[dict[str, Any]]:
+        """Fetch rows for `ids`, paging so no single query() response can
+        cross the gRPC message ceiling some gateways enforce.
+
+        A page that overflows anyway (the record cap bounds metadata rows by
+        count, not by bytes) is halved and retried, and the reduced size is
+        kept for the remaining pages so each of them does not have to fail
+        once first. Bisection stops at a single id: at that point a smaller
+        page is not available and the error is the caller's to see.
+
+        Every other error, and an overflow that survives down to one id,
+        propagates uncaught: a page failing partway through must not return
+        the pages that already succeeded, since callers treat an incomplete
+        result as a storage-consistency signal, not a partial one.
+        """
+        await self._run_gated(self._ensure_collection_loaded)
+
+        page_size = self._resolve_query_page_size(includes_vector=includes_vector)
+        rows: list[dict[str, Any]] = []
+        page_num = 0
+        start = 0
+        while start < len(ids):
+            page = ids[start : start + page_size]
+            id_list = '", "'.join(_escape_milvus_str(doc_id) for doc_id in page)
+            filter_expr = f'id in ["{id_list}"]'
+
+            try:
+                # Re-gated per page: a drop can start between two pages.
+                page_rows = await self._run_gated(
+                    self._client.query,
+                    collection_name=self.final_namespace,
+                    filter=filter_expr,
+                    output_fields=output_fields,
+                    consistency_level=MILVUS_POINT_READ_CONSISTENCY_LEVEL,
+                )
+            except Exception as e:
+                if len(page) == 1 or not self._is_response_too_large_error(e):
+                    raise
+                page_size = max(1, len(page) // 2)
+                logger.warning(
+                    f"[{self.workspace}] Milvus query response too large for "
+                    f"{len(page)} ids in {self.namespace}; retrying the page at "
+                    f"size {page_size}"
+                )
+                continue
+
+            rows.extend(page_rows or [])
+            start += len(page)
+            page_num += 1
+            # Each page is a blocking gRPC round-trip, so yield between pages
+            # rather than at the default 64-iteration cadence — that would
+            # need >16k ids before releasing the event loop once.
+            if start < len(ids):
+                await _cooperative_yield(page_num, every=1)
+
+        return rows
+
     async def get_by_id(self, id: str) -> dict[str, Any] | None:
         """Get vector data by its ID, with read-your-writes against the buffer."""
         async with self._flush_lock:
@@ -2698,16 +3466,20 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 return doc
 
         try:
+            # Past the buffer phase the _flush_lock is released, so a drop can
+            # start before this reaches the client.
             # Ensure collection is loaded before querying
-            self._ensure_collection_loaded()
+            await self._run_gated(self._ensure_collection_loaded)
 
             # Include all meta_fields (created_at is now always included) plus id
             output_fields = list(self.meta_fields) + ["id"]
 
-            result = self._client.query(
+            result = await self._run_gated(
+                self._client.query,
                 collection_name=self.final_namespace,
-                filter=f'id == "{id}"',
+                filter=f'id == "{_escape_milvus_str(id)}"',
                 output_fields=output_fields,
+                consistency_level=MILVUS_POINT_READ_CONSISTENCY_LEVEL,
             )
 
             if not result or len(result) == 0:
@@ -2743,31 +3515,23 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         result_map: dict[str, dict[str, Any]] = {}
         if remaining:
             try:
-                # Ensure collection is loaded before querying
-                self._ensure_collection_loaded()
-
                 # Include all meta_fields (created_at is now always included) plus id
                 output_fields = list(self.meta_fields) + ["id"]
 
-                id_list = '", "'.join(remaining)
-                filter_expr = f'id in ["{id_list}"]'
-
-                result = self._client.query(
-                    collection_name=self.final_namespace,
-                    filter=filter_expr,
-                    output_fields=output_fields,
+                rows = await self._query_rows_by_ids(
+                    remaining, output_fields, includes_vector=False
                 )
 
-                if result:
-                    for row in result:
-                        if not row:
-                            continue
-                        row_id = row.get("id")
-                        if row_id is not None:
-                            result_map[str(row_id)] = row
+                for row in rows:
+                    if not row:
+                        continue
+                    row_id = row.get("id")
+                    if row_id is not None:
+                        result_map[str(row_id)] = row
             except Exception as e:
                 logger.error(
-                    f"[{self.workspace}] Error retrieving vector data for IDs {remaining}: {e}"
+                    f"[{self.workspace}] Error retrieving vector data for "
+                    f"{len(remaining)} IDs (sample: {remaining[:5]}): {e}"
                 )
                 return []
 
@@ -2840,18 +3604,11 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             return result
 
         try:
-            self._ensure_collection_loaded()
-
-            id_list = '", "'.join(remaining)
-            filter_expr = f'id in ["{id_list}"]'
-
-            rows = self._client.query(
-                collection_name=self.final_namespace,
-                filter=filter_expr,
-                output_fields=["id", "vector"],
+            rows = await self._query_rows_by_ids(
+                remaining, ["id", "vector"], includes_vector=True
             )
 
-            for item in rows or []:
+            for item in rows:
                 if item and "vector" in item and "id" in item:
                     vector_data = item["vector"]
                     if isinstance(vector_data, np.ndarray):
@@ -2867,18 +3624,34 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             return result
 
     async def finalize(self):
-        """Flush pending vector ops; surface unflushed data as RuntimeError.
+        """Flush pending vector ops, then release the Milvus gRPC channel.
 
-        Milvus has no client connection to release (the MilvusClient is
-        stateless from the storage layer's perspective), but we still need
-        to fail loudly when a transient bulk error left writes buffered —
-        the caller must not believe storage finalized cleanly.
+        Every other server-backed storage releases its client here (Neo4j
+        driver, Postgres pool, Mongo client, OpenSearch ClientManager); the
+        MilvusClient owns a gRPC channel that should be closed explicitly
+        too — ``close()`` is already used for that purpose by
+        ``_rebuild_milvus_client``. We still fail loudly when a transient
+        bulk error left writes buffered — the caller must not believe
+        storage finalized cleanly.
         """
         flush_error: Exception | None = None
         try:
             await self._flush_pending_vector_ops()
         except Exception as e:
             flush_error = e
+
+        # Release the gRPC channel after the flush so the flush can still use
+        # the client. Best-effort: close() on a dead channel is a no-op (see
+        # _rebuild_milvus_client). The connection is freed on every exit path,
+        # matching the close-on-release pattern of the other server-backed
+        # storages (Neo4j / Postgres / Mongo / OpenSearch).
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception as close_error:
+                logger.warning(
+                    f"[{self.workspace}] Failed to close Milvus client: {close_error}"
+                )
 
         # Read the residual buffer sizes under the flush lock so the
         # snapshot is consistent with any racing late-arriving mutator
@@ -2905,7 +3678,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         """Drop all data from the Milvus collection. Destructive.
 
         MUST only be called when ``pipeline_status`` is idle (see the
-        Pipeline concurrency contract in ``AGENTS.md``); the only
+        Pipeline concurrency contract in ``docs/design/PipelineConcurrencyContract.md``); the only
         in-tree caller ``clear_documents`` enforces this.
 
         Caveat — only this instance's buffers are cleared. Other
@@ -2917,9 +3690,84 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         the freshly recreated collection. Direct callers bypassing the
         idle precondition MUST flush every aliased instance first.
 
+        Readers of this instance (``query`` / ``get_by_id`` / ``get_by_ids`` /
+        ``get_vectors_by_ids``) are held at ``_run_gated`` for the rebuild
+        instead of seeing a missing collection, including instances aliased
+        onto this same collection; reads already in flight are waited out
+        before the collection is removed. Writers are already excluded by
+        ``_flush_lock``. Readers on another loop or in another process are
+        not, and cannot be -- see that method for what the gate does not
+        close.
+
+        Cancellation: the rebuild is uninterruptible, and no cancellation --
+        the caller's own, or a shutdown cancelling every task -- returns this
+        method before the pool thread is done. Two things carry that, and
+        neither alone is enough: it is ONE submission rather than a sequence
+        of awaits (see ``_rebuild_collection``), and it is submitted
+        uninterruptibly from the caller's own task (see
+        ``run_in_milvus_executor_uninterruptible``), so ``_flush_lock``, the
+        closed reader gate and the caller's own ``destructive_busy``
+        reservation all stay held for exactly as long as the work they exclude
+        is running. The cancellation is re-raised afterwards, stamped, so a
+        caller rewriting it knows the drop did land. The state this rules out
+        does not self-heal like the ones
+        ``AGENTS.md`` *Consistency without transactions* accepts: nothing
+        recreates the collection at run time, and every later call fails on a
+        missing collection.
+
+        Every other copy of this workspace's vectors goes too, BEFORE the
+        active collection is rebuilt: the un-suffixed legacy collection the
+        model-suffix migration kept as a backup, and the ``_old`` / ``_temp``
+        collections an in-place schema migration leaves behind. Each is a
+        source ``initialize()`` refills a free collection name from, so one
+        left in place puts the dropped rows back -- see *Workspace clear and
+        sibling model containers* in ``docs/design/VectorSpaceProvenance.md``.
+        A legacy collection with no ``vector`` field is left alone: nothing
+        migrates it, and it may not be LightRAG's.
+
         Returns:
             dict[str, str]: ``{"status": "success"|"error", "message": str}``
         """
+
+        def _rebuild_collection() -> None:
+            """Remove the collection and put an empty one back, in ONE worker
+            operation.
+
+            Not four submissions: a task cancelled between them leaves the
+            namespace with no collection, and nothing recreates it at run time.
+            Awaiting is not what protects this sequence -- a shutdown that
+            cancels every pending task (``asyncio.run``'s ``_cancel_all_tasks``,
+            an ASGI teardown) reaches the inner task DIRECTLY, and a direct
+            cancellation is one ``_wait_deferring_cancellation`` re-raises
+            rather than defers. Once this is submitted the pool thread carries
+            it to the end no matter what the loop does, which is the only form
+            the guarantee can actually take.
+
+            The backups go FIRST. A crash after them leaves the active
+            collection still populated and nothing to refill it from, which a
+            re-run clears; a crash the other way round leaves a free name
+            beside a backup, which the next ``initialize()`` migrates or
+            restores into it.
+
+            Recreating must NOT route through _create_collection_if_not_exist:
+            it would run the recovery and migration paths this method has just
+            removed the sources of, for nothing.
+            """
+            self._drop_backup_collections()
+            if self._client.has_collection(self.final_namespace):
+                self._client.drop_collection(self.final_namespace)
+            self._create_collection_with_schema(self.final_namespace)
+            # The drop is durable from here on, and every later call loads the
+            # collection on demand: a failed load must not report the drop
+            # itself as failed.
+            try:
+                self._ensure_collection_loaded()
+            except MilvusCollectionLoadError as e:
+                logger.warning(
+                    f"[{self.workspace}] Collection {self.namespace} recreated empty; "
+                    f"initial load deferred to the next call: {e}"
+                )
+
         try:
             async with self._flush_lock:
                 # Discard any buffered writes before the collection is gone;
@@ -2927,19 +3775,36 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 self._pending_vector_docs.clear()
                 self._pending_vector_deletes.clear()
 
-                # Drop the collection and recreate it empty.
-                if self._client.has_collection(self.final_namespace):
-                    self._client.drop_collection(self.final_namespace)
-
-                # Recreate an EMPTY collection. Do NOT route through
-                # _create_collection_if_not_exist here: with the suffixed
-                # collection now gone it would see the intentionally-kept legacy
-                # collection and re-run the legacy->suffixed migration, pulling
-                # the just-dropped rows back in. That makes drop() non-empty
-                # (clear_documents would leave stale legacy data behind) and
-                # forces a needless full migration on every rebuild/clear.
-                self._create_collection_with_schema(self.final_namespace)
-                self._ensure_collection_loaded()
+                # Close the reader gate for the window where the collection
+                # does not exist: writers are excluded by _flush_lock, readers
+                # are not. Closing refuses new leases; draining waits out the
+                # reads that already hold one, so none of them is left querying
+                # a collection this is about to remove. That set includes reads
+                # still queued for a pool permit, so the drain can span a few
+                # round trips on a saturated pool -- see _CollectionGate.
+                gate = get_collection_gate(self.final_namespace)
+                gate.close()
+                try:
+                    await gate.wait_idle()
+                    # Inline, in the caller's own task, and submitted
+                    # uninterruptibly. No inner task: one registered separately
+                    # with the loop is one a shutdown can cancel on its own,
+                    # and the unwinding would then reopen the gate and release
+                    # _flush_lock -- and, above us, the destructive_busy
+                    # reservation -- while the thread still had the collection
+                    # to remove. A writer landing in that gap writes a row the
+                    # rebuild then erases, which is the one outcome
+                    # ``AGENTS.md`` *Consistency without transactions* never
+                    # allows. Holding the caller until the thread exits keeps
+                    # every one of those exclusions true for as long as the
+                    # work they protect is running.
+                    await run_in_milvus_executor_uninterruptible(_rebuild_collection)
+                finally:
+                    # Reopen even when the rebuild failed -- and even if the
+                    # drain above was what failed: a waiting reader must get
+                    # the server's real error, never hang behind a gate no
+                    # later call reopens.
+                    gate.reopen()
 
             logger.info(
                 f"[{self.workspace}] Process {os.getpid()} drop Milvus collection {self.namespace}"
@@ -2950,3 +3815,200 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 f"[{self.workspace}] Error dropping Milvus collection {self.namespace}: {e}"
             )
             return {"status": "error", "message": str(e)}
+
+    def _drop_backup_collections(self) -> None:
+        """Drop every backup copy of the ACTIVE model's collection. Blocking.
+
+        Runs on the Milvus pool, inside ``drop()``'s single submission. Two
+        kinds are left in place, each with a warning:
+
+          - a legacy collection (or its backup) with no ``vector`` field --
+            the test ``initialize()`` applies before migrating one, so what
+            is dropped is exactly what could come back;
+          - any backup whose description carries ANOTHER owner's marker: two
+            workspaces fold onto this name, and it is not ours to drop.
+        """
+        marker = self._ownership_marker()
+        backups = [
+            (f"{self.final_namespace}{tail}", False) for tail in ("_temp", "_old")
+        ]
+        if self.legacy_namespace != self.final_namespace:
+            backups += [
+                (f"{self.legacy_namespace}{tail}", True)
+                for tail in ("_temp", "_old", "")
+            ]
+        for name, needs_vector_field in backups:
+            if not self._client.has_collection(name):
+                continue
+            info = self._client.describe_collection(name)
+            description = info.get("description") or ""
+            if _OWNERSHIP_MARKER_PREFIX in description and marker not in description:
+                logger.warning(
+                    f"[{self.workspace}] Left collection '{name}' in place: it "
+                    f"is marked as another owner's"
+                )
+                continue
+            if needs_vector_field and not self._has_vector_field(info):
+                logger.warning(
+                    f"[{self.workspace}] Left collection '{name}' in place: it "
+                    f"has no vector field, so nothing migrates it"
+                )
+                continue
+            self._client.drop_collection(name)
+            logger.info(
+                f"[{self.workspace}] Dropped backup collection '{name}' with "
+                f"the workspace drop"
+            )
+
+    def model_container_name(self, model_name: str, embedding_dim: int) -> str | None:
+        suffix = self._collection_suffix_for(model_name, embedding_dim)
+        return f"{self.legacy_namespace}_{suffix}" if suffix else None
+
+    def _sibling_candidates(self) -> dict[str, list[tuple[str, str]]]:
+        """Group sibling-shaped collections by the model collection they belong to.
+
+        Blocking. Maps ``{ws}_{ns}_{model}_{dim}d`` to its existing members as
+        ``(name, description)``, ordered ``_temp``, ``_old``, then the
+        collection itself -- the order they must be dropped in, so a crash
+        never leaves the name free beside a backup ``initialize()`` would
+        restore into it. The active model's collections are excluded.
+        """
+        prefix = f"{self.legacy_namespace}_"
+        groups: dict[str, dict[str, str]] = {}
+        for name in self._client.list_collections():
+            if not name.startswith(prefix):
+                continue
+            matched = _SIBLING_COLLECTION_RE.search(name)
+            if not matched:
+                continue
+            base = name[: matched.start(1)] if matched.group(1) else name
+            if base == self.final_namespace:
+                continue
+            description = self._client.describe_collection(name).get("description")
+            groups.setdefault(base, {})[matched.group(1) or ""] = description or ""
+        return {
+            base: [
+                (f"{base}{tail}", members[tail])
+                for tail in ("_temp", "_old", "")
+                if tail in members
+            ]
+            for base, members in groups.items()
+        }
+
+    def _sibling_ownership(self, members: list[tuple[str, str]]) -> str:
+        """``"ours"``, ``"foreign"``, ``"conflict"`` or ``"unmarked"`` for one
+        model's collections.
+
+        Judged per family, not per collection: an ``_old`` backup keeps the
+        description of the collection it was renamed from, which may predate
+        the marker its rebuilt successor carries. So an UNMARKED member takes
+        the family's verdict -- but a member marked as another owner's never
+        does. When two workspaces fold onto one collection name, a schema
+        migration by one leaves an ``_old`` carrying the other's marker beside
+        its own live collection; a family holding both markers is a
+        ``"conflict"``, and nothing in it is ours to drop.
+        """
+        marker = self._ownership_marker()
+        descriptions = [description for _, description in members]
+        ours = any(marker in d for d in descriptions)
+        foreign = any(
+            _OWNERSHIP_MARKER_PREFIX in d and marker not in d for d in descriptions
+        )
+        if ours and foreign:
+            return "conflict"
+        if foreign:
+            return "foreign"
+        return "ours" if ours else "unmarked"
+
+    async def unvouched_sibling_containers(self) -> list[str]:
+        def _list() -> list[str]:
+            return sorted(
+                base
+                for base, members in self._sibling_candidates().items()
+                if self._sibling_ownership(members) == "unmarked"
+            )
+
+        return await run_in_milvus_executor(_list)
+
+    async def drop_sibling_models(
+        self, vouched: Collection[str] = ()
+    ) -> dict[str, str]:
+        """Drop every other model's collections owned by this workspace+namespace.
+
+        Collection names carry the workspace as a plain prefix, so one
+        workspace's prefix also matches another's (``a`` + ``chunks`` vs.
+        ``a_chunks_m`` + ``entities``). A collection is therefore dropped only
+        on evidence:
+
+          - its schema description carries this instance's ownership marker,
+            which ``_create_schema_for_namespace`` writes at creation; or
+          - it carries no marker at all and the caller ``vouched`` for it by
+            the name ``model_container_name`` / ``unvouched_sibling_containers``
+            gives.
+
+        A collection marked as another owner's is skipped. One with no marker
+        and no voucher is left in place and makes the result an ERROR naming
+        it: it may hold this workspace's vectors, and it may be another
+        workspace's. So does a family whose members carry BOTH this instance's
+        marker and another owner's: a voucher never overrides a marker. A
+        sibling's unmarked ``_temp`` / ``_old`` backups share its verdict and
+        are dropped before it, and nothing is recreated -- no running instance
+        serves a sibling. Same preconditions as ``drop()``.
+        """
+        vouched = frozenset(vouched)
+
+        def _drop_siblings() -> tuple[list[str], list[str], list[str]]:
+            dropped: list[str] = []
+            unmarked: list[str] = []
+            conflicting: list[str] = []
+            for base, members in self._sibling_candidates().items():
+                ownership = self._sibling_ownership(members)
+                if ownership == "unmarked" and base in vouched:
+                    ownership = "ours"
+                if ownership == "ours":
+                    for name, _ in members:
+                        self._client.drop_collection(name)
+                        dropped.append(name)
+                elif ownership == "unmarked":
+                    unmarked.append(base)
+                elif ownership == "conflict":
+                    conflicting.append(base)
+                # "foreign": another workspace or namespace owns it.
+            return dropped, unmarked, conflicting
+
+        try:
+            (
+                dropped,
+                unmarked,
+                conflicting,
+            ) = await run_in_milvus_executor_uninterruptible(_drop_siblings)
+        except Exception as e:
+            logger.error(
+                f"[{self.workspace}] Error dropping sibling model collections "
+                f"for Milvus namespace {self.namespace}: {e}"
+            )
+            return {"status": "error", "message": str(e)}
+        if dropped:
+            logger.info(
+                f"[{self.workspace}] Dropped sibling Milvus model collections: {dropped}"
+            )
+        problems = []
+        if unmarked:
+            problems.append(
+                f"collections without an ownership marker were left in place "
+                f"and may hold this workspace's vectors: {sorted(unmarked)}. "
+                f"Drop them with lightrag-clear-storage, which lists them and "
+                f"asks first, or by hand."
+            )
+        if conflicting:
+            problems.append(
+                f"collections marked both as this workspace's and as another "
+                f"owner's were left in place: {sorted(conflicting)}. Two "
+                f"workspaces share these names; inspect them and drop what is "
+                f"this workspace's by hand."
+            )
+        if problems:
+            message = " ".join(problems)
+            logger.warning(f"[{self.workspace}] {message}")
+            return {"status": "error", "message": message}
+        return {"status": "success", "message": "sibling models dropped"}

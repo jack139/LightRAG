@@ -1,8 +1,10 @@
 from ..utils import verbose_debug, VERBOSE_DEBUG
+import asyncio
 import os
 import logging
 import warnings
 
+import inspect
 from collections.abc import AsyncIterator
 
 import pipmaster as pm
@@ -14,24 +16,35 @@ if not pm.is_installed("openai"):
 
 from openai import (
     APIConnectionError,
+    APIStatusError,
     RateLimitError,
     APITimeoutError,
     InternalServerError,
     BadRequestError,
 )
+
+
 from tenacity import (
     retry,
     stop_after_attempt,
     wait_exponential,
+    retry_if_exception,
     retry_if_exception_type,
 )
+from lightrag.llm_roles import apply_llm_timeout
 from lightrag.utils import (
+    provider_timeout,
     wrap_embedding_func_with_attrs,
     safe_unicode_decode,
+    empty_length_truncated_hint,
     logger,
+    TruncatedResponse,
 )
 
 from lightrag.api import __api_version__
+from lightrag.exceptions import EmptyTruncatedResponseError
+from lightrag.tiktoken_cache import load_tiktoken_encoding
+from lightrag.llm._error_utils import is_permanent_rate_limit_error
 
 import numpy as np
 import base64
@@ -77,6 +90,27 @@ class InvalidResponseError(Exception):
     pass
 
 
+_INVALID_RESPONSE_SNIPPET_CHARS = 200
+
+
+def _describe_invalid_response(response: Any) -> str:
+    """Return the detail appended to the invalid-response error message.
+
+    Empty for a completion object (or ``None``): "no usable choices" has
+    nothing more to show. For anything else -- an OpenAI-compatible gateway
+    answering HTTP 200 with an HTML or plain-text error page, which the SDK
+    hands back as a ``str`` -- name the type and quote the start of the body,
+    so the log and the document's error message show what the gateway said.
+    """
+    if response is None or hasattr(response, "choices"):
+        return ""
+    text = response if isinstance(response, str) else repr(response)
+    snippet = " ".join(text.split())
+    if len(snippet) > _INVALID_RESPONSE_SNIPPET_CHARS:
+        snippet = snippet[:_INVALID_RESPONSE_SNIPPET_CHARS] + "..."
+    return f": expected a chat completion, got {type(response).__name__}: {snippet!r}"
+
+
 class TransientBadRequestError(Exception):
     """Wrapper to trigger retry on transient HTTP 400 errors.
 
@@ -88,6 +122,41 @@ class TransientBadRequestError(Exception):
     """
 
     pass
+
+
+# Retry ownership moved wholly to tenacity when the client stopped carrying the
+# SDK's own loop (``max_retries=0``), so the outer loop has to cover everything
+# the SDK's body-blind ``_should_retry`` used to: 408 request timeouts and 409
+# lock timeouts. Neither is matched by any other predicate here -- ``_make_status_error``
+# maps 409 to ConflictError and has no branch for 408 at all, so it arrives as a
+# bare APIStatusError. (429 and >=500 are covered by the RateLimitError and
+# InternalServerError predicates.)
+_TRANSIENT_STATUS_CODES = frozenset({408, 409})
+
+
+def _is_transient_status_error(error: BaseException) -> bool:
+    """tenacity predicate: retry the transient statuses the SDK used to retry."""
+    return (
+        isinstance(error, APIStatusError)
+        and getattr(error, "status_code", None) in _TRANSIENT_STATUS_CODES
+    )
+
+
+def _is_retryable_rate_limit_error(error: BaseException) -> bool:
+    """tenacity predicate: retry 429s, except permanent spend stops.
+
+    Used instead of ``retry_if_exception_type(RateLimitError)`` so a permanent
+    spend stop fails on the first attempt instead of paying the full backoff
+    window. Either way the caller receives the original RateLimitError (the
+    decorators set ``reraise=True``), so upstream ``except RateLimitError`` /
+    ``isinstance`` checks keep working and the doc-status failure summary
+    carries the provider's own message -- the LiteLLM budget figures, or
+    OpenAI's billing pointer. See :mod:`lightrag.llm._error_utils` for what
+    counts as permanent.
+    """
+    return isinstance(error, RateLimitError) and not is_permanent_rate_limit_error(
+        error
+    )
 
 
 def _validate_openai_response_format(response_format: Any | None) -> None:
@@ -125,12 +194,16 @@ def _get_tiktoken_encoding_for_model(model: str) -> Any:
     """
     if model not in _TIKTOKEN_ENCODING_CACHE:
         try:
-            _TIKTOKEN_ENCODING_CACHE[model] = tiktoken.encoding_for_model(model)
+            _TIKTOKEN_ENCODING_CACHE[model] = load_tiktoken_encoding(
+                lambda: tiktoken.encoding_for_model(model)
+            )
         except KeyError:
             logger.debug(
                 f"Encoding for model '{model}' not found, falling back to cl100k_base"
             )
-            _TIKTOKEN_ENCODING_CACHE[model] = tiktoken.get_encoding("cl100k_base")
+            _TIKTOKEN_ENCODING_CACHE[model] = load_tiktoken_encoding(
+                lambda: tiktoken.get_encoding("cl100k_base")
+            )
     return _TIKTOKEN_ENCODING_CACHE[model]
 
 
@@ -154,10 +227,28 @@ def create_openai_async_client(
         timeout: Request timeout in seconds.
         client_configs: Additional configuration options for the AsyncOpenAI client.
             These will override any default configurations but will be overridden by
-            explicit parameters (api_key, base_url).
+            explicit parameters (api_key, base_url). Pass ``max_retries`` here to
+            re-enable the SDK's own retry loop (see below). For non-Azure clients,
+            ``default_headers`` are merged with LightRAG's defaults, with caller
+            values taking precedence; names are matched case-insensitively.
 
     Returns:
         An AsyncOpenAI or AsyncAzureOpenAI client instance.
+
+    Retry ownership: the client is built with ``max_retries=0`` so the tenacity
+    decorators on ``openai_complete_if_cache`` / ``openai_embed`` are the only
+    retry layer. The SDK defaults to ``max_retries=2`` and its ``_should_retry``
+    is body-blind -- it retries every 429, including the permanent spend stops
+    (LiteLLM ``budget_exceeded``, OpenAI ``insufficient_quota``) that the
+    tenacity predicate exists to fail fast on, so those would still cost three
+    HTTP requests plus SDK backoff per call. It also multiplied with the outer
+    loop, making a transient failure cost up to 3x3 requests. Overridable
+    through ``client_configs`` for anyone who wants the SDK's ``Retry-After``
+    handling back.
+
+    Taking ownership means covering everything the SDK's loop covered:
+    connection errors, timeouts, 429 and >=500 already had predicates, and
+    ``_is_transient_status_error`` adds the 408 / 409 the SDK also retried.
     """
     if use_azure:
         from openai import AsyncAzureOpenAI
@@ -172,6 +263,8 @@ def create_openai_async_client(
 
         # Create a merged config dict with precedence: explicit params > client_configs
         merged_configs = {
+            # Retry ownership belongs to the tenacity decorators; see docstring.
+            "max_retries": 0,
             **client_configs,
             "api_key": api_key,
         }
@@ -202,8 +295,16 @@ def create_openai_async_client(
         if client_configs is None:
             client_configs = {}
 
+        # Header names are case-insensitive: a caller key that differs from a
+        # default only in case must replace it, not be sent alongside it.
+        canonical_names = {name.lower(): name for name in default_headers}
+        for name, value in (client_configs.get("default_headers") or {}).items():
+            default_headers[canonical_names.get(name.lower(), name)] = value
+
         # Create a merged config dict with precedence: explicit params > client_configs > defaults
         merged_configs = {
+            # Retry ownership belongs to the tenacity decorators; see docstring.
+            "max_retries": 0,
             **client_configs,
             "default_headers": default_headers,
             "api_key": api_key,
@@ -222,12 +323,71 @@ def create_openai_async_client(
         return AsyncOpenAI(**merged_configs)
 
 
-# TODO LengthFinishReasonError should not persist into LLM cache
+def _caller_supplied_http_client(client_configs: dict[str, Any] | None) -> bool:
+    """True when the caller injected a live ``http_client`` into AsyncOpenAI.
+
+    ``http_client=None`` is not ownership: the OpenAI SDK still builds its own
+    client in that case. ``http_async_client`` is not an AsyncOpenAI
+    constructor argument and is ignored.
+    """
+    if not client_configs:
+        return False
+    return client_configs.get("http_client") is not None
+
+
+async def _close_openai_client_if_unowned(
+    client: Any, caller_supplied_http_client: bool
+) -> None:
+    """Close an SDK-owned client; leave a caller-supplied httpx client open.
+
+    ``AsyncOpenAI.close()`` is ``await self._client.aclose()``. Closing a
+    client LightRAG did not create poisons tenacity retries and later calls
+    that reuse the same ``openai_client_configs["http_client"]``.
+    """
+    if caller_supplied_http_client:
+        return
+    try:
+        await client.close()
+    except Exception as close_error:
+        logger.warning(f"Failed to close OpenAI client: {close_error}")
+
+
+async def _close_openai_stream_response(response: Any) -> None:
+    """Release a streaming completion without assuming ``aclose``.
+
+    openai 2.x ``AsyncStream`` exposes async ``close()`` only. Stream cleanup
+    is independent of whether LightRAG owns the HTTP client.
+    """
+    closer = getattr(response, "aclose", None)
+    if not callable(closer):
+        closer = getattr(response, "close", None)
+    if not callable(closer):
+        return
+    try:
+        result = closer()
+        if inspect.isawaitable(result):
+            await result
+        logger.debug("Successfully closed stream response")
+    except (AttributeError, TypeError) as close_error:
+        logger.debug(
+            f"Stream response cleanup not supported by client wrapper: {close_error}"
+        )
+    except Exception as close_error:
+        logger.warning(
+            f"Unexpected error during stream response cleanup: {close_error}"
+        )
+
+
+# Token-limit-truncated completions (finish_reason == "length") are returned
+# wrapped in TruncatedResponse so the cache layer skips persisting incomplete
+# output. See the "Note on truncated structured output" in the docstring below.
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10),
     retry=(
-        retry_if_exception_type(RateLimitError)
+        retry_if_exception(_is_retryable_rate_limit_error)
+        # 408 / 409 -- retried by the SDK loop this client no longer runs.
+        | retry_if_exception(_is_transient_status_error)
         | retry_if_exception_type(APIConnectionError)
         | retry_if_exception_type(APITimeoutError)
         | retry_if_exception_type(InvalidResponseError)
@@ -237,6 +397,11 @@ def create_openai_async_client(
         # Retry transient "could not parse JSON body" 400s (see handler below).
         | retry_if_exception_type(TransientBadRequestError)
     ),
+    # Once retries are exhausted, raise the last attempt's own exception
+    # (APIConnectionError, InternalServerError, ...) instead of a
+    # tenacity.RetryError that hides the provider's message from callers and
+    # from the doc-status error_msg.
+    reraise=True,
 )
 async def openai_complete_if_cache(
     model: str,
@@ -271,12 +436,13 @@ async def openai_complete_if_cache(
     - ``keyword_extraction`` is deprecated; prefer
       ``response_format={"type": "json_object"}`` instead.
 
-    Note on truncated structured output: when the OpenAI SDK raises
-    `LengthFinishReasonError`, callers may still receive partial raw JSON from
-    `completion.choices[0].message.content`. That payload should be treated as
-    best-effort recovery only. If the JSON was truncated or repaired after
-    truncation, it is safer not to persist it into the LLM cache because later
-    runs with a higher token budget could otherwise keep reusing incomplete data.
+    Note on truncated structured output: when a completion stops with
+    `finish_reason == "length"`, callers may still receive partial raw JSON from
+    `completion.choices[0].message.content`. That payload is returned unchanged
+    for best-effort recovery, but wrapped in `TruncatedResponse` (a `str`
+    subclass) so the cache layer can detect and skip persisting it. This
+    prevents later runs — even with a higher token budget — from reusing the
+    incomplete data. See `is_truncated_response` in `lightrag.utils`.
 
     Note on `reasoning_content`: This feature relies on a Deepseek Style `reasoning_content`
     in the API response, which may be provided by OpenAI-compatible endpoints that support
@@ -323,7 +489,10 @@ async def openai_complete_if_cache(
             - openai_client_configs: Dict of configuration options for the AsyncOpenAI client.
                 These will be passed to the client constructor but will be overridden by
                 explicit parameters (api_key, base_url). Supports proxy configuration,
-                custom headers, retry policies, etc.
+                custom headers, retry policies, etc. A non-None ``http_client`` here
+                stays owned by the caller: LightRAG never closes it (not on retries,
+                errors, cancellation or success), so it can be shared across calls,
+                and the caller must close it when done.
 
     Returns:
         The completed text (with integrated COT content if available) or an async iterator
@@ -332,7 +501,10 @@ async def openai_complete_if_cache(
     Raises:
         InvalidResponseError: If the response from OpenAI is invalid or empty.
         APIConnectionError: If there is a connection error with the OpenAI API.
-        RateLimitError: If the OpenAI API rate limit is exceeded.
+        RateLimitError: If the OpenAI API rate limit is exceeded. Retried
+            with backoff, except for a permanent spend stop (a LiteLLM Proxy
+            ``budget_exceeded`` or an OpenAI ``insufficient_quota``), which
+            fails fast.
         APITimeoutError: If the OpenAI API request times out.
     """
     if history_messages is None:
@@ -345,8 +517,12 @@ async def openai_complete_if_cache(
     # Remove special kwargs that shouldn't be passed to OpenAI
     kwargs.pop("hashing_kv", None)
 
+    # <= 0 means the SDK default: None is not passed on below.
+    timeout = provider_timeout(timeout)
+
     # Extract client configuration options
     client_configs = kwargs.pop("openai_client_configs", {})
+    caller_supplied_http_client = _caller_supplied_http_client(client_configs)
 
     # Deprecation shims: map legacy boolean flags to response_format only when
     # an explicit response_format was not supplied by the caller. Prefer passing
@@ -430,44 +606,52 @@ async def openai_complete_if_cache(
     try:
         # Single dispatch: create() covers the dict-based response_format
         # payloads used by this project. Typed/Pydantic helpers are rejected
-        # above. Length-truncation is detected via finish_reason below and the
-        # raw content is returned unchanged so upstream tolerant JSON parsing
-        # can still salvage it.
+        # above. Length-truncated responses with non-empty content are
+        # returned unchanged so upstream tolerant JSON parsing can still
+        # salvage them; finish_reason is only inspected when content is empty
+        # (see the empty-content diagnostics below).
         response = await openai_async_client.chat.completions.create(
             model=api_model, messages=messages, **kwargs
         )
+    except asyncio.CancelledError:
+        # A cancelled request (query timeout, client gone) must not close a
+        # caller-supplied http_client: other concurrent calls may share it.
+        await _close_openai_client_if_unowned(
+            openai_async_client, caller_supplied_http_client
+        )
+        raise
     except APITimeoutError as e:
         logger.error(f"OpenAI API Timeout Error: {e}")
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        await _close_openai_client_if_unowned(
+            openai_async_client, caller_supplied_http_client
+        )
         raise
     except APIConnectionError as e:
         logger.error(f"OpenAI API Connection Error: {e}")
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        await _close_openai_client_if_unowned(
+            openai_async_client, caller_supplied_http_client
+        )
         raise
     except RateLimitError as e:
-        logger.error(f"OpenAI API Rate Limit Error: {e}")
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        if is_permanent_rate_limit_error(e):
+            logger.error(f"OpenAI API Spend Limit Reached (not retrying): {e}")
+        else:
+            logger.error(f"OpenAI API Rate Limit Error: {e}")
+        await _close_openai_client_if_unowned(
+            openai_async_client, caller_supplied_http_client
+        )
         raise
     except BadRequestError as e:
         # A "could not parse JSON body" 400 is transient (corrupted/truncated
         # request body in transit) and succeeds on retry; re-raise it as a
         # retryable type. Genuine 400s (bad params, content policy) fail fast.
-        # Either way we must close the client before re-raising, matching the
-        # other except branches above — otherwise non-transient 400s would
-        # leak httpx connections in validation-heavy/misconfigured runs.
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        # Either way we must close an SDK-owned client before re-raising,
+        # matching the other except branches above. Otherwise non-transient
+        # 400s would leak httpx connections in validation-heavy/misconfigured
+        # runs. A caller-supplied http_client is left open for the retry.
+        await _close_openai_client_if_unowned(
+            openai_async_client, caller_supplied_http_client
+        )
         # Heuristic: match on the provider's error wording. It can drift across
         # providers/proxies or localization, and a genuinely malformed request
         # body (e.g. invalid user-supplied JSON) could also surface this text —
@@ -492,10 +676,9 @@ async def openai_complete_if_cache(
         logger.error(
             f"OpenAI API Call Failed,\nModel: {model},\nParams: {kwargs}, Got: {e}{extra}"
         )
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        await _close_openai_client_if_unowned(
+            openai_async_client, caller_supplied_http_client
+        )
         raise
 
     if hasattr(response, "__aiter__"):
@@ -509,6 +692,10 @@ async def openai_complete_if_cache(
             cot_active = False
             cot_started = False
             initial_content_seen = False
+            # Set on GeneratorExit and CancelledError: the finally block must
+            # not yield on either, or cleanup is suspended before the stream
+            # and client are closed.
+            closing_without_yield = False
 
             try:
                 iteration_started = True
@@ -604,42 +791,54 @@ async def openai_complete_if_cache(
                     logger.debug(f"Streaming token usage (from API): {token_counts}")
                 elif token_tracker:
                     logger.debug("No usage information available in streaming response")
+            except GeneratorExit:
+                # Consumer disconnect mid-COT: tell the finally block below to
+                # skip its yield, which would otherwise abort cleanup with
+                # "async generator ignored GeneratorExit".
+                closing_without_yield = True
+                raise
+            except asyncio.CancelledError:
+                # A cancelled read (request timeout, client gone) mid-COT.
+                # CancelledError is a BaseException, so neither neighbouring
+                # handler sees it; without this clause the finally block hands
+                # "</think>" to the cancelled read in place of the
+                # cancellation, and cleanup stays suspended at that yield --
+                # a later aclose() then skips the stream and client close.
+                closing_without_yield = True
+                raise
             except Exception as e:
                 # Ensure COT is properly closed before handling exception
                 if enable_cot and cot_active:
                     try:
                         yield "</think>"
                         cot_active = False
+                    except GeneratorExit:
+                        # Consumer disconnect while closing COT on the error
+                        # path. GeneratorExit is a BaseException, so neither
+                        # the handler below nor the co-sibling ``except
+                        # GeneratorExit`` above sees it. Without this clause
+                        # the finally block yields into a closing generator,
+                        # aclose() raises "async generator ignored
+                        # GeneratorExit", and the frame is abandoned before
+                        # the stream and the client are ever closed.
+                        closing_without_yield = True
+                        raise
                     except Exception as close_error:
                         logger.warning(
                             f"Failed to close COT tag during exception handling: {close_error}"
                         )
 
                 logger.error(f"Error in stream response: {str(e)}")
-                # Try to clean up resources if possible
-                if (
-                    iteration_started
-                    and hasattr(response, "aclose")
-                    and callable(getattr(response, "aclose", None))
-                ):
-                    try:
-                        await response.aclose()
-                        logger.debug("Successfully closed stream response after error")
-                    except Exception as close_error:
-                        logger.warning(
-                            f"Failed to close stream response: {close_error}"
-                        )
-                # Ensure client is closed in case of exception
-                try:
-                    await openai_async_client.close()
-                except Exception as client_close_error:
-                    logger.warning(
-                        f"Failed to close OpenAI client after stream error: {client_close_error}"
-                    )
+                if iteration_started:
+                    await _close_openai_stream_response(response)
+                await _close_openai_client_if_unowned(
+                    openai_async_client, caller_supplied_http_client
+                )
                 raise
             finally:
-                # Final safety check for unclosed COT tags
-                if enable_cot and cot_active:
+                # Final safety check for unclosed COT tags, skipped while
+                # closing via GeneratorExit or CancelledError (see above).
+                if enable_cot and cot_active and not closing_without_yield:
                     try:
                         yield "</think>"
                         cot_active = False
@@ -648,51 +847,52 @@ async def openai_complete_if_cache(
                             f"Failed to close COT tag in finally block: {final_close_error}"
                         )
 
-                # Ensure resources are released even if no exception occurs
-                # Note: Some wrapped clients (e.g., Langfuse) may not implement aclose() properly
-                if iteration_started and hasattr(response, "aclose"):
-                    aclose_method = getattr(response, "aclose", None)
-                    if callable(aclose_method):
-                        try:
-                            await response.aclose()
-                            logger.debug("Successfully closed stream response")
-                        except (AttributeError, TypeError) as close_error:
-                            # Some wrapper objects may report hasattr(aclose) but fail when called
-                            # This is expected behavior for certain client wrappers
-                            logger.debug(
-                                f"Stream response cleanup not supported by client wrapper: {close_error}"
-                            )
-                        except Exception as close_error:
-                            logger.warning(
-                                f"Unexpected error during stream response cleanup: {close_error}"
-                            )
+                # Stream cleanup is independent of HTTP-client ownership:
+                # openai 2.x AsyncStream.close() must still run so an
+                # early-stopped response does not pin the connection.
+                if iteration_started:
+                    await _close_openai_stream_response(response)
 
-                # This prevents resource leaks since the caller doesn't handle closing
-                try:
-                    await openai_async_client.close()
-                    logger.debug(
-                        "Successfully closed OpenAI client for streaming response"
-                    )
-                except Exception as client_close_error:
-                    logger.warning(
-                        f"Failed to close OpenAI client in streaming finally block: {client_close_error}"
-                    )
+                await _close_openai_client_if_unowned(
+                    openai_async_client, caller_supplied_http_client
+                )
 
         return inner()
 
     else:
         try:
+            # Count usage BEFORE the validation raises below: the request
+            # consumed its budget whether or not the response is usable — a
+            # reasoning model that burned the whole output budget on its
+            # trace is exactly the case that raises, and omitting it would
+            # under-report by a full-budget generation.
+            if token_tracker and hasattr(response, "usage"):
+                token_counts = {
+                    "prompt_tokens": getattr(response.usage, "prompt_tokens", 0),
+                    "completion_tokens": getattr(
+                        response.usage, "completion_tokens", 0
+                    ),
+                    "total_tokens": getattr(response.usage, "total_tokens", 0),
+                }
+                token_tracker.add_usage(token_counts)
+
+            # Compatible gateways can return non-JSON bodies that the SDK
+            # exposes as strings rather than completion objects.
             if (
                 not response
+                or not hasattr(response, "choices")
                 or not response.choices
                 or not hasattr(response.choices[0], "message")
             ):
-                logger.error("Invalid response from OpenAI API")
-                try:
-                    await openai_async_client.close()
-                except Exception as close_error:
-                    logger.warning(f"Failed to close OpenAI client: {close_error}")
-                raise InvalidResponseError("Invalid response from OpenAI API")
+                error_message = (
+                    "Invalid response from OpenAI API"
+                    + _describe_invalid_response(response)
+                )
+                logger.error(error_message)
+                await _close_openai_client_if_unowned(
+                    openai_async_client, caller_supplied_http_client
+                )
+                raise InvalidResponseError(error_message)
 
             message = response.choices[0].message
 
@@ -743,39 +943,84 @@ async def openai_complete_if_cache(
 
                 # Validate final content
                 if not final_content or final_content.strip() == "":
-                    logger.error("Received empty content from OpenAI API")
-                    try:
-                        await openai_async_client.close()
-                    except Exception as close_error:
-                        logger.warning(f"Failed to close OpenAI client: {close_error}")
-                    raise InvalidResponseError("Received empty content from OpenAI API")
+                    # Distinguish the empty-content failure modes so the retry
+                    # ERROR lines (and the final re-raised error) carry the root
+                    # cause: reasoning models swallowing output vs token-limit
+                    # truncation vs a genuinely empty response.
+                    finish_reason = getattr(response.choices[0], "finish_reason", None)
+                    usage = getattr(response, "usage", None)
+                    completion_tokens = getattr(usage, "completion_tokens", None)
+                    usage_details = getattr(usage, "completion_tokens_details", None)
+                    reasoning_tokens = getattr(usage_details, "reasoning_tokens", None)
+                    reasoning_len = (
+                        len(reasoning_content.strip()) if reasoning_content else 0
+                    )
+                    diagnostics = (
+                        f"finish_reason={finish_reason if finish_reason is not None else 'n/a'}, "
+                        f"completion_tokens={completion_tokens if completion_tokens is not None else 'n/a'}, "
+                        f"reasoning_tokens={reasoning_tokens if reasoning_tokens is not None else 'n/a'}, "
+                        f"reasoning_content_len={reasoning_len}"
+                    )
+                    if finish_reason == "length":
+                        hint = empty_length_truncated_hint(
+                            "consider raising max_tokens or disabling thinking mode",
+                            reasoning_consumed_budget=bool(reasoning_len),
+                        )
+                    elif reasoning_len:
+                        hint = (
+                            "model returned reasoning-only output "
+                            "(reasoning_content is discarded on this path); "
+                            "consider disabling thinking mode for this role"
+                        )
+                    else:
+                        hint = "model produced no output"
+                    error_message = (
+                        f"Received empty content from OpenAI API "
+                        f"({diagnostics}): {hint}"
+                    )
+                    logger.error(error_message)
+                    await _close_openai_client_if_unowned(
+                        openai_async_client, caller_supplied_http_client
+                    )
+                    # The hint rides along into the exception (and therefore
+                    # into doc_status.error_msg) rather than living only in the
+                    # server log: the operator reading the failed document is
+                    # the one who has to turn the knob.
+                    #
+                    # The TYPE selects the retry policy: token-limit exhaustion
+                    # is deterministic for a given prompt and output budget, so
+                    # it raises EmptyTruncatedResponseError — absent from the
+                    # retry predicate — and fails after one request instead of
+                    # buying two more full-budget generations plus backoff.
+                    # The other empty modes stay retryable: those are sampling
+                    # artifacts a fresh attempt can genuinely fix.
+                    if finish_reason == "length":
+                        raise EmptyTruncatedResponseError(error_message)
+                    raise InvalidResponseError(error_message)
 
             # Apply Unicode decoding to final content if needed
             if r"\u" in final_content:
                 final_content = safe_unicode_decode(final_content.encode("utf-8"))
 
-            if token_tracker and hasattr(response, "usage"):
-                token_counts = {
-                    "prompt_tokens": getattr(response.usage, "prompt_tokens", 0),
-                    "completion_tokens": getattr(
-                        response.usage, "completion_tokens", 0
-                    ),
-                    "total_tokens": getattr(response.usage, "total_tokens", 0),
-                }
-                token_tracker.add_usage(token_counts)
+            # Flag token-limit truncation so the cache layer skips persisting
+            # partial output. The content is still returned unchanged for
+            # best-effort salvage (e.g. tolerant JSON parsing); TruncatedResponse
+            # is a str subclass, so downstream processing is unaffected.
+            if getattr(response.choices[0], "finish_reason", None) == "length":
+                logger.warning(
+                    "OpenAI response truncated by token limit "
+                    f"(finish_reason=length, content_len={len(final_content)}), returning partial content"
+                )
+                final_content = TruncatedResponse(final_content)
 
             logger.debug(f"Response content len: {len(final_content)}")
             verbose_debug(f"Response: {response}")
 
             return final_content
         finally:
-            # Ensure client is closed in all cases for non-streaming responses
-            try:
-                await openai_async_client.close()
-            except Exception as close_error:
-                logger.warning(
-                    f"Failed to close OpenAI client in non-streaming finally block: {close_error}"
-                )
+            await _close_openai_client_if_unowned(
+                openai_async_client, caller_supplied_http_client
+            )
 
 
 async def openai_complete(
@@ -786,6 +1031,7 @@ async def openai_complete(
     entity_extraction=False,
     **kwargs,
 ) -> Union[str, AsyncIterator[str]]:
+    apply_llm_timeout(kwargs, client_config_keys=("openai_client_configs",))
     if history_messages is None:
         history_messages = []
     # Pop entity_extraction from kwargs if also passed there (avoid duplication)
@@ -811,6 +1057,7 @@ async def gpt_4o_complete(
     entity_extraction=False,
     **kwargs,
 ) -> str:
+    apply_llm_timeout(kwargs, client_config_keys=("openai_client_configs",))
     if history_messages is None:
         history_messages = []
     entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
@@ -835,6 +1082,7 @@ async def gpt_4o_mini_complete(
     entity_extraction=False,
     **kwargs,
 ) -> str:
+    apply_llm_timeout(kwargs, client_config_keys=("openai_client_configs",))
     if history_messages is None:
         history_messages = []
     entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
@@ -859,6 +1107,7 @@ async def nvidia_openai_complete(
     entity_extraction=False,
     **kwargs,
 ) -> str:
+    apply_llm_timeout(kwargs, client_config_keys=("openai_client_configs",))
     if history_messages is None:
         history_messages = []
     entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
@@ -886,12 +1135,17 @@ async def nvidia_openai_complete(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=60),
     retry=(
-        retry_if_exception_type(RateLimitError)
+        retry_if_exception(_is_retryable_rate_limit_error)
+        # 408 / 409 -- retried by the SDK loop this client no longer runs.
+        | retry_if_exception(_is_transient_status_error)
         | retry_if_exception_type(APIConnectionError)
         | retry_if_exception_type(APITimeoutError)
         # Retry transient HTTP 5xx (OpenAI 500 / proxy upstream errors).
         | retry_if_exception_type(InternalServerError)
     ),
+    # Same as openai_complete_if_cache: surface the last attempt's own error,
+    # not a tenacity.RetryError.
+    reraise=True,
 )
 async def openai_embed(
     texts: list[str],
@@ -936,7 +1190,9 @@ async def openai_embed(
         client_configs: Additional configuration options for the AsyncOpenAI/AsyncAzureOpenAI client.
             These will override any default configurations but will be overridden by
             explicit parameters (api_key, base_url). Supports proxy configuration,
-            custom headers, retry policies, etc.
+            custom headers, retry policies, etc. A non-None ``http_client`` here
+            stays owned by the caller: LightRAG never closes it, so it can be
+            shared across calls, and the caller must close it when done.
         token_tracker: Optional token usage tracker for monitoring API usage.
         use_azure: Whether to use Azure OpenAI service instead of standard OpenAI.
             When True, creates an AsyncAzureOpenAI client. Default is False.
@@ -956,7 +1212,10 @@ async def openai_embed(
 
     Raises:
         APIConnectionError: If there is a connection error with the OpenAI API.
-        RateLimitError: If the OpenAI API rate limit is exceeded.
+        RateLimitError: If the OpenAI API rate limit is exceeded. Retried
+            with backoff, except for a permanent spend stop (a LiteLLM Proxy
+            ``budget_exceeded`` or an OpenAI ``insufficient_quota``), which
+            fails fast.
         APITimeoutError: If the OpenAI API request times out.
     """
     # Apply context-based prefixes if provided
@@ -975,7 +1234,16 @@ async def openai_embed(
                 truncated_texts.append(text)
                 continue
 
-            tokens = encoding.encode(text)
+            # disallowed_special=() is required, not an optimization: tiktoken
+            # defaults to disallowed_special=ALL and raises ValueError as soon as
+            # the text merely CONTAINS a literal special-token string such as
+            # "<|endoftext|>". Since this encode runs for every non-empty text
+            # once truncation is enabled, one chunk of user content quoting that
+            # marker -- common in documentation, notes, or captured model output
+            # -- failed the whole embedding batch regardless of its length. The
+            # markers must be encoded as ordinary text, exactly as
+            # Tokenizer.encode does for every other tokenizing path.
+            tokens = encoding.encode(text, disallowed_special=())
             if len(tokens) > max_token_size:
                 truncated_tokens = tokens[:max_token_size]
                 truncated_texts.append(encoding.decode(truncated_tokens))
@@ -1002,8 +1270,9 @@ async def openai_embed(
         api_version=api_version,
         client_configs=client_configs,
     )
+    caller_supplied_http_client = _caller_supplied_http_client(client_configs)
 
-    async with openai_async_client:
+    try:
         # Determine the correct model identifier to use
         # For Azure OpenAI, we must use the deployment name instead of the model name
         api_model = azure_deployment if use_azure and azure_deployment else model
@@ -1039,6 +1308,10 @@ async def openai_embed(
                 else np.frombuffer(base64.b64decode(dp.embedding), dtype=np.float32)
                 for dp in response.data
             ]
+        )
+    finally:
+        await _close_openai_client_if_unowned(
+            openai_async_client, caller_supplied_http_client
         )
 
 
@@ -1113,6 +1386,7 @@ async def azure_openai_complete(
 
     Provides backward compatibility for azure_openai_complete calls.
     """
+    apply_llm_timeout(kwargs, client_config_keys=("openai_client_configs",))
     if history_messages is None:
         history_messages = []
     entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
@@ -1146,6 +1420,7 @@ async def azure_openai_embed(
     context: str = "document",
     query_prefix: str | None = None,
     document_prefix: str | None = None,
+    max_token_size: int | None = None,
 ) -> np.ndarray:
     """Azure OpenAI embedding wrapper function.
 
@@ -1154,6 +1429,12 @@ async def azure_openai_embed(
 
     All parameters from the underlying openai_embed are exposed to ensure
     full feature parity and API consistency.
+
+    ``max_token_size`` must stay a named parameter here: EmbeddingFunc.__call__
+    injects it from the @wrap_embedding_func_with_attrs decorator only when
+    the wrapped function's own signature declares it, and it is then
+    forwarded to openai_embed.func to truncate oversized texts before they
+    reach the Azure API, exactly as the standard OpenAI binding does.
 
     IMPORTANT - Decorator Usage:
 
@@ -1216,6 +1497,7 @@ async def azure_openai_embed(
         base_url=base_url,
         api_key=api_key,
         embedding_dim=embedding_dim,
+        max_token_size=max_token_size,
         token_tracker=token_tracker,
         client_configs=client_configs,
         use_azure=True,

@@ -87,12 +87,12 @@ def write_sidecar(
         block_drawing_path_style: How ``<drawing path="...">`` in
             ``blocks.jsonl`` resolves the asset path. ``"with_prefix"``
             (default) renders ``<base>.blocks.assets/<filename>`` — matches
-            the path stored in ``drawings.json``. ``"basename_only"``
-            renders just ``<filename>``; legacy native docx convention
-            (downstream consumers read the file path from ``drawings.json``,
-            not from this attribute, so the basename-only form is purely
-            cosmetic but kept for byte-equivalence with the original
-            adapter).
+            the path stored in ``drawings.json`` and the spec contract
+            (a non-empty ``path`` always points inside ``*.blocks.assets/``).
+            ``"basename_only"`` renders just ``<filename>``; a legacy
+            convention no in-tree adapter uses anymore — the parameter is
+            kept only for public-API compatibility, and new callers should
+            not pass it.
 
     Returns:
         Dict shaped like the pipeline's existing ``parsed_data`` payload:
@@ -282,6 +282,8 @@ def write_sidecar(
         }
         if block.table_header:
             row["table_header"] = block.table_header
+        if block.is_title_block:
+            row["is_title_block"] = True
         blocks_lines.append(json.dumps(row, ensure_ascii=False))
         merged_parts.append(rendered)
 
@@ -330,11 +332,18 @@ def write_sidecar(
     blocks_path.write_text(
         "\n".join([json.dumps(meta, ensure_ascii=False)] + blocks_lines) + "\n",
         encoding="utf-8",
+        newline="\n",
     )
 
     # Sidecar JSONs end with a trailing newline (POSIX text-file convention;
     # also keeps end-of-file linters / pre-commit hooks happy and matches the
     # ``blocks.jsonl`` convention above).
+    #
+    # ``newline="\n"`` on every artifact here: the sidecar is a byte-level
+    # interchange format (the golden fixtures under
+    # ``tests/parser/docx/golden/`` are compared byte-for-byte), so the bytes
+    # must not depend on the host platform. Without it ``Path.write_text``
+    # translates each ``\n`` to ``os.linesep`` and a Windows parse emits CRLF.
     if tables:
         tables_path.write_text(
             json.dumps(
@@ -344,6 +353,7 @@ def write_sidecar(
             )
             + "\n",
             encoding="utf-8",
+            newline="\n",
         )
     if drawings:
         drawings_path.write_text(
@@ -354,6 +364,7 @@ def write_sidecar(
             )
             + "\n",
             encoding="utf-8",
+            newline="\n",
         )
     if equations:
         equations_path.write_text(
@@ -364,6 +375,7 @@ def write_sidecar(
             )
             + "\n",
             encoding="utf-8",
+            newline="\n",
         )
 
     logger.info(
@@ -438,8 +450,21 @@ def _materialize_assets(
             target_path.write_bytes(spec.source)
         elif spec.source is None:
             # Assumed already on disk at the target location (native_docx
-            # writes assets during extraction). Verify presence; warn if
-            # missing.
+            # writes assets during extraction). The file is looked up under
+            # the producer's own name, so a name that sanitising or collision
+            # suffixing changed would resolve to a different file -- possibly
+            # another asset -- instead of the one the producer wrote. Refuse
+            # it rather than render the wrong image. Producers that write in
+            # place must name files with ``safe_asset_filename``.
+            if target_name != spec.suggested_name:
+                logger.warning(
+                    "[sidecar] asset ref=%s declared in place as %r but its "
+                    "canonical name is %r; skipping",
+                    spec.ref,
+                    spec.suggested_name,
+                    target_name,
+                )
+                continue
             if not target_path.exists():
                 logger.warning(
                     "[sidecar] asset ref=%s declared in place but %s is absent",
@@ -462,7 +487,7 @@ def _materialize_assets(
 
 def _allocate_unique_name(suggested: str, used: set[str]) -> str:
     """Make ``suggested`` unique within ``used``: ``foo.png`` → ``foo-2.png``."""
-    suggested = _safe_asset_filename(suggested)
+    suggested = safe_asset_filename(suggested)
     if suggested not in used:
         return suggested
     stem = Path(suggested).stem
@@ -475,11 +500,29 @@ def _allocate_unique_name(suggested: str, used: set[str]) -> str:
         n += 1
 
 
-def _safe_asset_filename(suggested: str) -> str:
-    """Collapse parser-suggested asset names to a safe filename."""
+def safe_asset_filename(suggested: str) -> str:
+    """Collapse a parser-suggested asset name to a safe, canonical filename.
+
+    Keeps only the basename (``/`` and ``\\`` both count as separators), drops
+    C0 control characters and DEL, strips leading whitespace and trailing
+    whitespace and dots, and falls back to ``asset`` when nothing is left.
+    Leading dots are kept: ``.foo.png`` is a legitimate name. Trailing dots and
+    spaces go because Windows drops them when it resolves a filename.
+
+    The result is idempotent. A producer that writes an asset into the assets
+    directory itself (``AssetSpec(source=None)``) must name the file with this
+    function, because the writer refuses an in-place asset whose name it would
+    have to change.
+    """
     name = Path(str(suggested).replace("\\", "/")).name
-    name = "".join(c for c in name.strip() if ord(c) >= 32 and c != "\x7f").strip(".")
-    return name or "asset"
+    name = "".join(c for c in name if ord(c) >= 32 and c != "\x7f").lstrip()
+    # Trailing whitespace and dots in any mix. A plain scan, not a regex: an
+    # unanchored ``[\s.]+$`` retries every run start and is quadratic on a
+    # long run of dots that does not reach the end (``"." * n + "x.png"``).
+    end = len(name)
+    while end and (name[end - 1] == "." or name[end - 1].isspace()):
+        end -= 1
+    return name[:end] or "asset"
 
 
 def _render_block_content(
@@ -520,17 +563,13 @@ def _render_block_content(
         if drawing is None:
             return ""
         im_id = drawing_id_by_key.get(key, "")
-        if drawing.path_override is not None:
-            # Verbatim external/linked reference — pass through unchanged.
-            path = drawing.path_override
+        filename = asset_paths.get(drawing.asset_ref, "")
+        if not filename:
+            path = ""
+        elif block_drawing_path_style == "basename_only":
+            path = filename
         else:
-            filename = asset_paths.get(drawing.asset_ref, "")
-            if not filename:
-                path = ""
-            elif block_drawing_path_style == "basename_only":
-                path = filename
-            else:
-                path = f"{asset_prefix}{filename}"
+            path = f"{asset_prefix}{filename}"
         return render_drawing_tag(
             im_id,
             drawing.fmt,
@@ -624,11 +663,8 @@ def _drawing_item_dict(
     asset_paths: dict[str, str],
     asset_prefix: str,
 ) -> dict[str, Any]:
-    if drawing.path_override is not None:
-        path = drawing.path_override
-    else:
-        filename = asset_paths.get(drawing.asset_ref, "")
-        path = f"{asset_prefix}{filename}" if filename else ""
+    filename = asset_paths.get(drawing.asset_ref, "")
+    path = f"{asset_prefix}{filename}" if filename else ""
     item: dict[str, Any] = {
         "id": drawing_id,
         "blockid": blockid,

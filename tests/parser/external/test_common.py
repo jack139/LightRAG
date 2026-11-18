@@ -17,6 +17,7 @@ import json
 import zipfile
 from pathlib import Path
 
+import httpx
 import pytest
 
 from lightrag.parser.external import (
@@ -33,6 +34,8 @@ from lightrag.parser.external import (
     write_manifest,
 )
 
+
+pytestmark = pytest.mark.offline
 
 # ---------------------------------------------------------------------------
 # compute_size_and_hash
@@ -72,7 +75,9 @@ def test_clear_dir_contents_keeps_dir_and_removes_children(tmp_path: Path) -> No
 
 
 def test_clear_dir_contents_noop_when_missing(tmp_path: Path) -> None:
-    clear_dir_contents(tmp_path / "does-not-exist")
+    missing = tmp_path / "does-not-exist"
+    clear_dir_contents(missing)
+    assert not missing.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -141,18 +146,49 @@ def test_safe_extract_zip_rejects_absolute_path(tmp_path: Path) -> None:
         safe_extract_zip(payload, tmp_path / "raw")
 
 
+@pytest.mark.offline
+@pytest.mark.parametrize(
+    "name", ["..notes.md", "...report.md", "..assets/figure.png", "nested/..notes.md"]
+)
+def test_safe_extract_zip_allows_dot_prefixed_names(tmp_path: Path, name: str) -> None:
+    payload = _make_zip({name: b"Document content"})
+
+    assert safe_extract_zip(payload, tmp_path) == [name]
+    assert (tmp_path / name).read_bytes() == b"Document content"
+
+
+@pytest.mark.offline
+@pytest.mark.parametrize(
+    "name", ["..", "../outside.md", "nested/../../outside.md", "/outside.md"]
+)
+def test_safe_extract_zip_rejects_unsafe_bundle_before_writing(
+    tmp_path: Path, name: str
+) -> None:
+    destination = tmp_path / "bundle"
+    payload = _make_zip({"safe.md": b"safe", name: b"unsafe"})
+
+    with pytest.raises(RuntimeError, match="unsafe path"):
+        safe_extract_zip(payload, destination)
+
+    assert not (destination / "safe.md").exists()
+    assert not (tmp_path / "outside.md").exists()
+
+
 # ---------------------------------------------------------------------------
 # env coercion
 # ---------------------------------------------------------------------------
 
 
-def test_env_bool_truthy_falsy(monkeypatch: pytest.MonkeyPatch) -> None:
-    for raw in ("1", "true", "yes", "ON"):
-        monkeypatch.setenv("X", raw)
-        assert env_bool("X", False) is True
-    for raw in ("0", "false", "no", "off"):
-        monkeypatch.setenv("X", raw)
-        assert env_bool("X", True) is False
+@pytest.mark.parametrize("raw", ["1", "true", "yes", "ON"])
+def test_env_bool_truthy(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+    monkeypatch.setenv("X", raw)
+    assert env_bool("X", False) is True
+
+
+@pytest.mark.parametrize("raw", ["0", "false", "no", "off"])
+def test_env_bool_falsy(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+    monkeypatch.setenv("X", raw)
+    assert env_bool("X", True) is False
 
 
 def test_env_bool_falls_back_on_unrecognized(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -233,3 +269,191 @@ def test_manifest_load_rejects_wrong_engine(tmp_path: Path) -> None:
 
 def test_manifest_load_handles_missing_file(tmp_path: Path) -> None:
     assert load_manifest(tmp_path / "no-such-dir", expected_engine="docling") is None
+
+
+@pytest.mark.parametrize("payload", [b"\xff", b'{"engine":'])
+def test_manifest_load_treats_undecodable_file_as_missing(
+    tmp_path: Path, payload: bytes
+) -> None:
+    # Invalid UTF-8 raises UnicodeDecodeError (a ValueError, not an OSError)
+    # before json.loads runs; it must read as a stale bundle, like malformed
+    # JSON, instead of escaping and failing the parse on every retry.
+    raw = tmp_path / "demo.docling_raw"
+    raw.mkdir()
+    (raw / "_manifest.json").write_bytes(payload)
+    assert load_manifest(raw, expected_engine="docling") is None
+
+
+# ---------------------------------------------------------------------------
+# download_timeout
+# ---------------------------------------------------------------------------
+
+
+async def test_download_timeout_is_the_stdlib_asyncio_timeout():
+    import asyncio
+
+    from lightrag.parser.external._common import download_timeout
+
+    # asyncio.timeout() needs a running loop to compute its deadline even
+    # just to construct the Timeout object, hence this test is async.
+    result = download_timeout(5.0)
+    assert isinstance(result, asyncio.Timeout), (
+        f"expected asyncio.Timeout, got {type(result).__name__}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# stream_capped_get -- Accept-Encoding: identity + Content-Encoding rejection
+#
+# Uses genuine httpx.AsyncByteStream fixtures (not content=...-preloaded
+# responses) so these tests prove a rejected stream is never consumed.
+# ---------------------------------------------------------------------------
+
+
+class _GenuineStream(httpx.AsyncByteStream):
+    """A streamed byte source with nothing preloaded, unlike
+    ``httpx.Response(..., content=...)``."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            yield chunk
+
+    async def aclose(self) -> None:
+        pass
+
+
+class _NeverIterateStream(httpx.AsyncByteStream):
+    """Fails the test immediately if ever iterated, proving a rejected
+    response's body is never touched."""
+
+    async def __aiter__(self):
+        pytest.fail("body stream was iterated despite a rejected Content-Encoding")
+        yield b""  # pragma: no cover -- unreachable; makes this an async generator
+
+    async def aclose(self) -> None:
+        pass
+
+
+async def test_stream_capped_get_sends_accept_encoding_identity():
+    """Accept-Encoding: identity must override httpx's own default
+    ('gzip, deflate, zstd'), not merely be added alongside it."""
+    from lightrag.parser.external._common import stream_capped_get
+
+    seen_headers: dict[str, str] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen_headers.update(request.headers)
+        return httpx.Response(200, stream=_GenuineStream([b"ok"]))
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        await stream_capped_get(
+            client, "https://x/y", max_bytes=None, operation="identity header check"
+        )
+
+    assert seen_headers.get("accept-encoding") == "identity"
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"content-encoding": "identity"},
+        {"content-encoding": "  Identity  "},
+        {"content-encoding": "IDENTITY"},
+    ],
+    ids=["absent", "identity", "identity-whitespace", "identity-uppercase"],
+)
+async def test_stream_capped_get_accepts_absent_or_identity_encoding(headers):
+    from lightrag.parser.external._common import stream_capped_get
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, stream=_GenuineStream([b"data ", b"chunk"]), headers=headers
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        resp, body = await stream_capped_get(
+            client, "https://x/y", max_bytes=None, operation="accept check"
+        )
+
+    assert body == b"data chunk"
+
+
+@pytest.mark.parametrize(
+    "content_encoding",
+    [
+        "gzip",
+        "deflate",
+        "br",
+        "zstd",
+        "gzip, identity",
+        "identity, gzip",
+        "chunked",
+        "",
+        "gzip;q=1.0",
+    ],
+    ids=[
+        "gzip",
+        "deflate",
+        "br",
+        "zstd",
+        "multiple-gzip-identity",
+        "multiple-identity-gzip",
+        "malformed-chunked",
+        "malformed-empty",
+        "malformed-qvalue",
+    ],
+)
+async def test_stream_capped_get_rejects_non_identity_encoding(content_encoding):
+    """Also proves the rejected stream is never iterated (via
+    _NeverIterateStream) and that the error names the operation but not
+    the URL, for every encoding/malformed-value case in one pass."""
+    from lightrag.parser.external._common import stream_capped_get
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=_NeverIterateStream(),
+            headers={"content-encoding": content_encoding},
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(RuntimeError) as excinfo:
+            await stream_capped_get(
+                client,
+                "https://x/result.zip?token=secret",
+                max_bytes=None,
+                operation="my download op",
+            )
+
+    message = str(excinfo.value)
+    assert "my download op" in message
+    assert "https://x/result.zip?token=secret" not in message
+    assert "secret" not in message
+
+
+async def test_stream_capped_get_cap_still_interrupts_an_accepted_identity_stream():
+    """Regression guard: the encoding gate must not weaken the existing
+    oversized-response protection for the (now identity-only) accepted
+    path."""
+    from lightrag.parser.external._common import stream_capped_get
+
+    chunks = [b"x" * 1000 for _ in range(50)]  # 50,000 bytes total
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=_GenuineStream(chunks))
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(RuntimeError) as excinfo:
+            await stream_capped_get(
+                client, "https://x/y", max_bytes=10_000, operation="cap check"
+            )
+
+    assert "10000 bytes" in str(excinfo.value)

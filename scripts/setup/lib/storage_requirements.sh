@@ -9,9 +9,30 @@ declare -ag KV_STORAGE_OPTIONS=(
   "RedisKVStorage"
 )
 
+# What the SERVER uses when .env names no KV backend. A rerun has to know it:
+# an omitted selection is not an absence of one, and the records of such a
+# deployment are in this backend's container.
+declare -g DEFAULT_KV_STORAGE="JsonKVStorage"
+
+# The configuration storage is its own category and admits four backends.
+# RedisKVStorage is deliberately absent; unset configuration with Redis KV
+# defaults to JSON -- see docs/design/ConfigurationStorageContract.md.
+declare -ag CONFIG_STORAGE_OPTIONS=(
+  "JsonKVStorage"
+  "PGKVStorage"
+  "MongoKVStorage"
+  "OpenSearchKVStorage"
+)
+
+# PGGraphStorage (Apache AGE) is deprecated (DEPRECATED_STORAGES in
+# lightrag/kg/__init__.py) and deliberately absent: a new deployment is
+# offered PGTableGraphStorage, which needs no extension. select_storage_backends
+# adds it back for a deployment that already uses it, so it can be kept, and
+# the PostgreSQL service is then generated from templates/postgres-age.yml.
+# It stays in the requirement tables below either way.
 declare -ag GRAPH_STORAGE_OPTIONS=(
   "NetworkXStorage"
-  "PGGraphStorage"
+  "PGTableGraphStorage"
   "MongoGraphStorage"
   "OpenSearchGraphStorage"
   "MemgraphStorage"
@@ -47,6 +68,7 @@ declare -Ag STORAGE_ENV_REQUIREMENTS=(
   ["MongoGraphStorage"]="MONGO_URI MONGO_DATABASE"
   ["MemgraphStorage"]="MEMGRAPH_URI"
   ["PGGraphStorage"]="POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DATABASE"
+  ["PGTableGraphStorage"]="POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DATABASE"
   ["OpenSearchGraphStorage"]="OPENSEARCH_HOSTS OPENSEARCH_USER OPENSEARCH_PASSWORD"
   ["NanoVectorDBStorage"]=""
   ["MilvusVectorDBStorage"]="MILVUS_URI MILVUS_DB_NAME"
@@ -71,6 +93,7 @@ declare -Ag STORAGE_DB_TYPES=(
   ["RedisDocStatusStorage"]="redis"
   ["PGKVStorage"]="postgresql"
   ["PGGraphStorage"]="postgresql"
+  ["PGTableGraphStorage"]="postgresql"
   ["PGVectorStorage"]="postgresql"
   ["PGDocStatusStorage"]="postgresql"
   ["Neo4JStorage"]="neo4j"

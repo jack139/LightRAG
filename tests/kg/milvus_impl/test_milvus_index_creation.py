@@ -11,6 +11,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 from lightrag.kg.milvus_impl import (
     MILVUS_MAX_VARCHAR_BYTES,
+    MilvusException,
     MilvusIndexConfig,
     MilvusVectorDBStorage,
 )
@@ -66,6 +67,7 @@ def _make_model_storage(namespace="entities", workspace="test_workspace", dim=12
         workspace=workspace,
         global_config={
             "embedding_batch_num": 100,
+            "working_dir": "/tmp/lightrag",
             "vector_db_storage_cls_kwargs": {
                 "cosine_better_than_threshold": 0.3,
             },
@@ -248,7 +250,9 @@ class TestMilvusIndexCreation:
         assert client.create_collection.call_args.kwargs["collection_name"] == (
             storage.final_namespace
         )
-        client.load_collection.assert_called_with(storage.final_namespace)
+        client.load_collection.assert_called_with(
+            storage.final_namespace, timeout=storage._load_timeout
+        )
 
     def test_model_suffix_collection_naming_with_workspace(self):
         storage = MilvusVectorDBStorage(
@@ -319,7 +323,9 @@ class TestMilvusIndexCreation:
             storage.final_namespace
         )
         client.query_iterator.assert_not_called()
-        client.load_collection.assert_called_with(storage.final_namespace)
+        client.load_collection.assert_called_with(
+            storage.final_namespace, timeout=storage._load_timeout
+        )
 
     def test_existing_suffixed_collection_is_validated_and_used(self):
         storage = _make_model_storage()
@@ -338,7 +344,9 @@ class TestMilvusIndexCreation:
 
         migrate.assert_not_called()
         client.create_collection.assert_not_called()
-        client.load_collection.assert_called_with(storage.final_namespace)
+        client.load_collection.assert_called_with(
+            storage.final_namespace, timeout=storage._load_timeout
+        )
 
     def test_legacy_old_meta_schema_migrates_to_suffixed_collection(self):
         storage = _make_model_storage()
@@ -371,7 +379,9 @@ class TestMilvusIndexCreation:
         client.query_iterator.assert_not_called()
         client.insert.assert_not_called()
         client.create_collection.assert_not_called()
-        client.load_collection.assert_called_with(storage.final_namespace)
+        client.load_collection.assert_called_with(
+            storage.final_namespace, timeout=storage._load_timeout
+        )
 
     def test_legacy_new_schema_migrates_to_suffixed_collection(self):
         storage = _make_model_storage(namespace="chunks")
@@ -405,7 +415,9 @@ class TestMilvusIndexCreation:
         client.insert.assert_not_called()
         client.rename_collection.assert_not_called()
         client.create_collection.assert_not_called()
-        client.load_collection.assert_called_with(storage.final_namespace)
+        client.load_collection.assert_called_with(
+            storage.final_namespace, timeout=storage._load_timeout
+        )
 
     def test_legacy_same_dimension_migrates_to_suffixed_collection(self):
         storage = _make_model_storage()
@@ -435,7 +447,9 @@ class TestMilvusIndexCreation:
         client.describe_collection.assert_called_once_with(storage.legacy_namespace)
         client.query_iterator.assert_not_called()
         client.create_collection.assert_not_called()
-        client.load_collection.assert_called_with(storage.final_namespace)
+        client.load_collection.assert_called_with(
+            storage.final_namespace, timeout=storage._load_timeout
+        )
 
     def test_no_model_suffix_old_meta_schema_migrates_in_place(self):
         storage = _make_storage(namespace="entities")
@@ -452,7 +466,9 @@ class TestMilvusIndexCreation:
 
         migrate.assert_called_once_with()
         client.create_collection.assert_not_called()
-        client.load_collection.assert_called_with(storage.final_namespace)
+        client.load_collection.assert_called_with(
+            storage.final_namespace, timeout=storage._load_timeout
+        )
 
     def test_legacy_dimension_mismatch_creates_suffixed_collection_without_migration(
         self,
@@ -938,6 +954,79 @@ class TestMilvusIndexCreation:
         bootstrap_client.list_databases.assert_called_once_with()
         bootstrap_client.create_database.assert_not_called()
         bootstrap_client.use_database.assert_called_once_with("lightrag")
+
+    def test_create_database_race_already_exists_is_swallowed(self):
+        """Two workers can both see the database missing and race to create it;
+        the loser's create_database('already exist') must not fail startup."""
+        storage = _make_model_storage()
+        bootstrap_client = MagicMock()
+        bootstrap_client.list_databases.return_value = ["default"]
+        bootstrap_client.create_database.side_effect = MilvusException(
+            message="Database already exist[database=lightrag]"
+        )
+
+        with patch.dict("os.environ", {"MILVUS_DB_NAME": "lightrag"}, clear=False):
+            with patch(
+                "lightrag.kg.milvus_impl.MilvusClient",
+                return_value=bootstrap_client,
+            ):
+                client = storage._create_milvus_client()
+
+        bootstrap_client.create_database.assert_called_once_with("lightrag")
+        bootstrap_client.use_database.assert_called_once_with("lightrag")
+        assert client is bootstrap_client
+
+    def test_create_database_race_message_match_is_case_insensitive(self):
+        storage = _make_model_storage()
+        bootstrap_client = MagicMock()
+        bootstrap_client.list_databases.return_value = ["default"]
+        bootstrap_client.create_database.side_effect = MilvusException(
+            message="Database Already Exists"
+        )
+
+        with patch.dict("os.environ", {"MILVUS_DB_NAME": "lightrag"}, clear=False):
+            with patch(
+                "lightrag.kg.milvus_impl.MilvusClient",
+                return_value=bootstrap_client,
+            ):
+                storage._create_milvus_client()
+
+        bootstrap_client.use_database.assert_called_once_with("lightrag")
+
+    def test_create_database_unrelated_milvus_exception_is_reraised(self):
+        """A genuine failure (not a create race) must still abort startup."""
+        storage = _make_model_storage()
+        bootstrap_client = MagicMock()
+        bootstrap_client.list_databases.return_value = ["default"]
+        bootstrap_client.create_database.side_effect = MilvusException(
+            message="permission denied"
+        )
+
+        with patch.dict("os.environ", {"MILVUS_DB_NAME": "lightrag"}, clear=False):
+            with patch(
+                "lightrag.kg.milvus_impl.MilvusClient",
+                return_value=bootstrap_client,
+            ):
+                with pytest.raises(MilvusException, match="permission denied"):
+                    storage._create_milvus_client()
+
+        bootstrap_client.use_database.assert_not_called()
+
+    def test_create_database_non_milvus_exception_is_not_swallowed(self):
+        """Only MilvusException is inspected for the race message; anything
+        else propagates unmodified."""
+        storage = _make_model_storage()
+        bootstrap_client = MagicMock()
+        bootstrap_client.list_databases.return_value = ["default"]
+        bootstrap_client.create_database.side_effect = RuntimeError("connection reset")
+
+        with patch.dict("os.environ", {"MILVUS_DB_NAME": "lightrag"}, clear=False):
+            with patch(
+                "lightrag.kg.milvus_impl.MilvusClient",
+                return_value=bootstrap_client,
+            ):
+                with pytest.raises(RuntimeError, match="connection reset"):
+                    storage._create_milvus_client()
 
     def test_existing_collection_missing_vector_index_is_repaired(self):
         """Existing collections missing vector indexes should be repaired automatically."""

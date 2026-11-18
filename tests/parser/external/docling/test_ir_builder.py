@@ -19,6 +19,8 @@ import pytest
 from lightrag.parser.external.docling.ir_builder import DoclingIRBuilder
 
 
+pytestmark = pytest.mark.offline
+
 # ---------------------------------------------------------------------------
 # Helpers to build inline fixtures
 # ---------------------------------------------------------------------------
@@ -250,6 +252,8 @@ def test_docling_adapter_preserves_docling_heading_level(tmp_path: Path) -> None
     ir = DoclingIRBuilder().normalize_from_workdir(raw_dir, document_name="demo.pdf")
     levels = [b.level for b in ir.blocks]
     assert levels == [2, 2, 2]  # all bumped by +1, no normalization
+    # No title → no IR level 1; same-level siblings are not each other's parents.
+    assert [b.parent_headings for b in ir.blocks] == [[], [], []]
 
 
 # ---------------------------------------------------------------------------
@@ -676,6 +680,36 @@ def test_docling_adapter_picture_referenced_asset(tmp_path: Path) -> None:
     assert a.suggested_name == "image_000000_abc.png"
     # intrinsic_size lands in extras for downstream VLM filtering
     assert drawing.extras["intrinsic_size"] == [100.0, 200.0]
+
+
+def test_docling_adapter_picture_http_uri_kept_as_src(tmp_path: Path) -> None:
+    # A remote image the engine did not materialize: the drawing survives
+    # (placeholder + caption context), but with no asset — path renders
+    # empty and the URL is kept only as src metadata.
+    pictures = [
+        {
+            "self_ref": "#/pictures/0",
+            "label": "picture",
+            "content_layer": "body",
+            "image": {
+                "uri": "https://cdn.example.com/x.png",
+                "mimetype": "image/png",
+            },
+            "prov": [],
+        }
+    ]
+    raw_dir = _write_doc(
+        tmp_path,
+        _doc(body_children=["#/pictures/0"], pictures=pictures),
+    )
+
+    ir = DoclingIRBuilder().normalize_from_workdir(raw_dir, document_name="demo.pdf")
+    drawing = ir.blocks[0].drawings[0]
+    assert drawing.asset_ref == ""
+    assert drawing.src == "https://cdn.example.com/x.png"
+    assert drawing.fmt == "png"
+    assert ir.assets == []
+    assert "{{IMG:" in ir.blocks[0].content_template
 
 
 # ---------------------------------------------------------------------------

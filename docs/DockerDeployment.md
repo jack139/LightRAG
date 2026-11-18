@@ -57,8 +57,8 @@ validation rules and provider-specific behavior.
 
 **RAG Configuration**
 
-- `MAX_ASYNC_LLM`: Maximum async operations (deprecated alias: `MAX_ASYNC`)
-- `MAX_TOKENS`: Maximum token size
+- `MAX_ASYNC_LLM`: Base maximum LLM concurrency (deprecated alias: `MAX_ASYNC`). It also sets the per-document chunk-extraction task limit, while each entity/relation merge phase uses twice that task limit; see [File Processing Pipeline Specification](./FileProcessingPipeline.md) for the full pipeline and role-override rules.
+- `MAX_TOTAL_TOKENS`: Maximum total token budget for query context (entities, relations, and text chunks).
 - `EMBEDDING_DIM`: Embedding dimensions
 
 ## 🐳 Docker Deployment
@@ -74,7 +74,7 @@ The Dockerfile uses BuildKit cache mounts to significantly improve build perform
 - **Efficient package caching**: UV and Bun package downloads are cached across builds
 - **No manual configuration needed**: Works out of the box in Docker Compose and GitHub Actions
 
-### Start LightRAG  server:
+### Start LightRAG server:
 
 ```bash
 docker compose up -d
@@ -248,17 +248,53 @@ Those templates already pin the matching vLLM `--dtype` (`float32` on CPU, `floa
 The setup wizard stages TLS certificate files under `./data/certs/` before generating the compose file.
 This keeps generated host mounts under the same `./data` root used by the default Docker deployment.
 
+### Custom UI content
+
+`docker-compose.yml` and `docker-compose-full.yml` mount `./data/ui_templates`
+read-only at `/app/data/ui_templates` and set `UI_TEMPLATES_DIR` to it. That
+entry overrides the same key in `.env`, like `WORKING_DIR` and `INPUT_DIR`, so
+one `.env` full of host paths keeps serving a source run as well. Both stay
+inert until the directory actually holds a bundle: with no `manifest.json`
+in it the server logs a warning naming the directory and serves its built-in
+branding, so the default deployment starts normally. Drop a bundle in and
+restart, and the server replaces the welcome page, the login-page text and user
+agreement, the query empty state, the copyright line and the brand logo with the
+bundle's content — per language, without rebuilding the frontend. From that point on the bundle
+is validated in full: an invalid one makes the server refuse to start.
+
+Create the directory before the first `up` so it is not created root-owned by
+Docker:
+
+```bash
+mkdir -p ./data/ui_templates
+cp -r docs/ui_templates_example/* ./data/ui_templates/
+```
+
+**Podman**: `docker-compose.podman.yml` keeps the mount and `UI_TEMPLATES_DIR`
+commented out, because Podman is stricter than Docker about a bind mount whose
+host source is missing. There, create the directory first and then uncomment
+**both** — uncommenting the environment entry alone leaves the server pointed
+at a path that is not mounted, and it refuses to start.
+
+See [UserDefinedUI.md](./UserDefinedUI.md) ([中文](./UserDefinedUI-zh.md)) for
+the bundle format and the full deployment guide.
+
 ### PostgreSQL image
 
-The interactive setup defaults PostgreSQL to `gzdaniel/postgres-for-rag:pg18-age-pgvector`. This image bundles both Apache AGE and pgvector so the generated stack works with `PGGraphStorage` and `PGVectorStorage` without extra extension setup.
+The interactive setup defaults PostgreSQL to the official pgvector image, `pgvector/pgvector:pg18-trixie`. pgvector is the only extension the PostgreSQL storages need: `PGVectorStorage` uses it, and `PGTableGraphStorage`, the PostgreSQL graph storage, keeps the entity-relation graph in ordinary indexed tables. The tag is a multi-architecture manifest covering `linux/amd64` and `linux/arm64`.
 
-The image no longer ships fixed credentials; on first start it creates the user, password, and database from the `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` environment variables. The setup wizard prompts for these values (defaulting to `rag` / `rag` / `lightrag`) and injects them into the generated `docker-compose.final.yml`, so you can choose any user, password, and database name.
+On first start the image creates the user, password, and database from the `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` environment variables. The setup wizard prompts for these values (defaulting to `rag` / `rag` / `lightrag`) and injects them into the generated `docker-compose.final.yml`, so you can choose any user, password, and database name.
 
-**Important Note**: If PGGraphStorage is not required for vector storage, you may replace the upper docker image with the latest official pgvector image `pgvector/pgvector:pg18`. Please note that data file formats are incompatible across different PostgreSQL major versions; once this Docker image is deployed, it cannot be rolled back to a previous version.
+**Deployments on `PGGraphStorage`.** `PGGraphStorage` is deprecated and will be removed in a future release. It needs Apache AGE, which the pgvector image does not have. The wizard offers `PGGraphStorage` only to a deployment whose `.env` already selects it. Such a deployment can keep it: the wizard then generates the PostgreSQL service with `gzdaniel/postgres-for-rag:pg18-age-pgvector`, the image earlier versions used for everyone, and a rerun keeps the image of a PostgreSQL service it already manages. To leave AGE behind:
 
-#### Build the PostgreSQL image
+- Move the graph to `PGTableGraphStorage` first, while the AGE image is still running: stop LightRAG and run `python -m lightrag.tools.migrate_graph_storage --apply` (see [README_MIGRATE_GRAPH_STORAGE.md](../lightrag/tools/README_MIGRATE_GRAPH_STORAGE.md)). The graph is copied without re-indexing the documents. Without AGE, `PGGraphStorage` cannot start and the tool cannot read the old graph.
+- Then choose `PGTableGraphStorage` with `make env-storage` and set `postgres.image` to `pgvector/pgvector:pg18-trixie`. That tag has the same Debian base as the AGE image, so the existing data volume opens as it is. The plain `pgvector/pgvector:pg18` tag is built on an older Debian, and PostgreSQL then warns about a collation version mismatch on every connection to a database the AGE image created.
 
-The default PostgreSQL image can be rebuilt from the repository root with `Dockerfile.postgres`. The Dockerfile starts from `pgvector/pgvector:pg18-trixie`, builds Apache AGE for PostgreSQL 18, and installs an init script that creates both the `vector` and `age` extensions for new databases.
+Please note that data file formats are incompatible across different PostgreSQL major versions; once this Docker image is deployed, it cannot be rolled back to a previous version.
+
+#### Build the AGE-enabled PostgreSQL image
+
+Only `PGGraphStorage` needs Apache AGE. An AGE-enabled image can be built from the repository root with `Dockerfile.postgres`. The Dockerfile starts from `pgvector/pgvector:pg18-trixie`, builds Apache AGE for PostgreSQL 18, and installs an init script that creates both the `vector` and `age` extensions for new databases.
 
 For local development or single-host deployment:
 
@@ -302,6 +338,8 @@ docker compose up
 ### Offline deployment
 
 Software packages requiring `transformers`, `torch`, or `cuda` are not preinstalled in the docker images. Consequently, document extraction tools such as Docling, as well as local LLM models like Hugging Face and LMDeploy, cannot be used in an offline environment. These high-compute-resource-demanding services should not be integrated into LightRAG. Docling will be decoupled and deployed as a standalone service.
+
+The main image bundles everything the native docx parser's opt-in `smart_heading` engine parameter needs: the spaCy runtime plus the pinned `zh_core_web_sm` / `en_core_web_sm` 3.8.0 models are baked in at build time, so `smart_heading` works fully offline out of the box. The lite image ships the spaCy runtime (it comes with the `api` extra) but not the models — enabling `smart_heading` there requires installing them first (`lightrag-download-cache --spacy-install`, or see [OfflineDeployment.md](./OfflineDeployment.md) for air-gapped hosts).
 
 ## 📦 Build Docker Images
 

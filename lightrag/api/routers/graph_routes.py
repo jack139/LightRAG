@@ -5,12 +5,79 @@ This module contains all graph-related routes for the LightRAG API.
 from typing import Optional, Dict, Any
 import traceback
 from fastapi import APIRouter, Depends, Query, HTTPException
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from lightrag.base import DeletionResult
+from lightrag.exceptions import (
+    AdminWriteHoldExceededError,
+    PipelineReservationConflictError,
+)
 from lightrag.utils import logger
-from ..utils_api import get_combined_auth_dependency
+from lightrag.utils_graph import resolve_entity_name_for_lookup
+from ..utils_api import get_combined_auth_dependency, internal_server_error
 from .document_routes import check_pipeline_busy_or_raise
+
+
+def _gate_refusal_to_http(exc: PipelineReservationConflictError) -> HTTPException:
+    """Map a core-level admin-write gate refusal to the HTTP status it means.
+
+    ``LightRAG._admin_write_gate`` raises
+    ``AdminWriteGateRefusedError`` -- a ``PipelineReservationConflictError`` --
+    when an admin write cannot proceed: another admin write held the workspace
+    admin lock past its acquire timeout, or the pipeline holds ``busy`` /
+    ``scanning``. Both are bounded windows the client should retry (409), told
+    apart by the stable leading phrase of the ``detail`` text
+    (``ADMIN_WRITE_LOCK_BUSY_PREFIX`` vs ``ADMIN_WRITE_PIPELINE_BUSY_PREFIX`` in
+    ``lightrag.exceptions``); a workspace fenced for recovery is 503, as in
+    ``check_pipeline_busy_or_raise``. The message is the gate's own wording,
+    which names no internal paths or hosts.
+    """
+    return HTTPException(
+        status_code=503 if exc.recovery_required else 409, detail=str(exc)
+    )
+
+
+def _hold_exceeded_to_http(
+    exc: AdminWriteHoldExceededError, context: str
+) -> HTTPException:
+    """Map the admin-write hold ceiling's expiry to an ACTIONABLE HTTP 500.
+
+    ``AdminWriteHoldExceededError`` is a ``TimeoutError``, so it is not a
+    ``PipelineReservationConflictError`` and the generic ``except Exception``
+    below would otherwise route it through ``internal_server_error`` -- whose
+    body is a generic message plus a correlation id, by design. That would drop
+    the one thing the caller has to act on: whether the storage commit was
+    allowed to finish, and that the object must be re-read before the edit is
+    retried. A client does not read server logs, so a blind retry into "entity
+    already exists" or a re-applied edit is exactly what it would do next.
+
+    500, not 503 or 504: the operation failed loud, and a
+    retry-suggesting status is the wrong signal for a write that may already be
+    durable.
+
+    Exposing the message is safe and is not the CWE-209 case
+    ``internal_server_error`` guards: this text is entirely self-authored --
+    the operation name, the ceiling in seconds, the environment variable that
+    sets it, and what to do next -- and names no host, path, credential or
+    query. The 400 and 409 paths in this module already pass self-authored
+    messages through the same way. The full exception is still logged
+    server-side by the caller.
+    """
+    logger.error(f"Admin-write hold ceiling exceeded {context}: {exc}")
+    return HTTPException(status_code=500, detail=str(exc))
+
+
+def _failed_deletion_status(result: DeletionResult) -> int:
+    """HTTP status for a ``fail`` deletion: 400 when it was refused on its
+    arguments (the helper says so through ``status_code``), else 500."""
+    return 400 if result.status_code == 400 else 500
+
+
+def _require_nonempty_entity_name(entity_name: str) -> str:
+    """Strip and reject blank names so create/update match delete routes."""
+    if not entity_name or not entity_name.strip():
+        raise ValueError("Entity name cannot be empty")
+    return entity_name.strip()
 
 
 class EntityUpdateRequest(BaseModel):
@@ -19,11 +86,32 @@ class EntityUpdateRequest(BaseModel):
     allow_rename: bool = False
     allow_merge: bool = False
 
+    @field_validator("entity_name", mode="after")
+    @classmethod
+    def validate_entity_name(cls, entity_name: str) -> str:
+        return _require_nonempty_entity_name(entity_name)
+
+    @model_validator(mode="after")
+    def validate_rename_target_name(self) -> "EntityUpdateRequest":
+        # Rename payloads put the new name in updated_data["entity_name"].
+        if "entity_name" not in self.updated_data:
+            return self
+        new_name = self.updated_data["entity_name"]
+        if not isinstance(new_name, str):
+            raise ValueError("Entity name cannot be empty")
+        self.updated_data["entity_name"] = _require_nonempty_entity_name(new_name)
+        return self
+
 
 class RelationUpdateRequest(BaseModel):
     source_id: str
     target_id: str
     updated_data: Dict[str, Any]
+
+    @field_validator("source_id", "target_id", mode="after")
+    @classmethod
+    def validate_endpoint_names(cls, entity_name: str) -> str:
+        return _require_nonempty_entity_name(entity_name)
 
 
 class EntityMergeRequest(BaseModel):
@@ -35,10 +123,20 @@ class EntityMergeRequest(BaseModel):
     )
     entity_to_change_into: str = Field(
         ...,
-        description="Target entity name that will receive all relationships from the source entities. This entity will be preserved.",
+        description="Target entity name that will receive all relationships from the source entities. An existing entity is preserved and merged; a missing target is created.",
         min_length=1,
         examples=["Elon Musk"],
     )
+
+    @field_validator("entities_to_change", mode="after")
+    @classmethod
+    def validate_entities_to_change(cls, entities: list[str]) -> list[str]:
+        return [_require_nonempty_entity_name(name) for name in entities]
+
+    @field_validator("entity_to_change_into", mode="after")
+    @classmethod
+    def validate_entity_to_change_into(cls, entity_name: str) -> str:
+        return _require_nonempty_entity_name(entity_name)
 
 
 class EntityCreateRequest(BaseModel):
@@ -59,6 +157,11 @@ class EntityCreateRequest(BaseModel):
         ],
     )
 
+    @field_validator("entity_name", mode="after")
+    @classmethod
+    def validate_entity_name(cls, entity_name: str) -> str:
+        return _require_nonempty_entity_name(entity_name)
+
 
 class DeleteEntityRequest(BaseModel):
     entity_name: str = Field(..., description="The name of the entity to delete.")
@@ -66,9 +169,7 @@ class DeleteEntityRequest(BaseModel):
     @field_validator("entity_name", mode="after")
     @classmethod
     def validate_entity_name(cls, entity_name: str) -> str:
-        if not entity_name or not entity_name.strip():
-            raise ValueError("Entity name cannot be empty")
-        return entity_name.strip()
+        return _require_nonempty_entity_name(entity_name)
 
 
 class DeleteRelationRequest(BaseModel):
@@ -78,9 +179,7 @@ class DeleteRelationRequest(BaseModel):
     @field_validator("source_entity", "target_entity", mode="after")
     @classmethod
     def validate_entity_names(cls, entity_name: str) -> str:
-        if not entity_name or not entity_name.strip():
-            raise ValueError("Entity name cannot be empty")
-        return entity_name.strip()
+        return _require_nonempty_entity_name(entity_name)
 
 
 class RelationCreateRequest(BaseModel):
@@ -98,7 +197,12 @@ class RelationCreateRequest(BaseModel):
     )
     relation_data: Dict[str, Any] = Field(
         ...,
-        description="Dictionary containing relationship properties. Common fields include 'description', 'keywords', and 'weight'.",
+        description=(
+            "Relationship properties. Weight is the distinct-source evidence "
+            "floor plus an optional boost and cannot be below the number of "
+            "distinct real source_id values. Omit source_id for a source-less "
+            "non-negative fractional weight."
+        ),
         examples=[
             {
                 "description": "Elon Musk is the CEO of Tesla",
@@ -107,6 +211,11 @@ class RelationCreateRequest(BaseModel):
             }
         ],
     )
+
+    @field_validator("source_entity", "target_entity", mode="after")
+    @classmethod
+    def validate_entity_names(cls, entity_name: str) -> str:
+        return _require_nonempty_entity_name(entity_name)
 
 
 def create_graph_routes(rag, api_key: Optional[str] = None):
@@ -131,9 +240,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         except Exception as e:
             logger.error(f"Error getting graph labels: {str(e)}")
             logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500, detail=f"Error getting graph labels: {str(e)}"
-            )
+            raise internal_server_error(e)
 
     @router.get("/graph/label/popular", dependencies=[Depends(combined_auth)])
     async def get_popular_labels(
@@ -155,9 +262,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         except Exception as e:
             logger.error(f"Error getting popular labels: {str(e)}")
             logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500, detail=f"Error getting popular labels: {str(e)}"
-            )
+            raise internal_server_error(e)
 
     @router.get("/graph/label/search", dependencies=[Depends(combined_auth)])
     async def search_labels(
@@ -181,9 +286,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         except Exception as e:
             logger.error(f"Error searching labels with query '{q}': {str(e)}")
             logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500, detail=f"Error searching labels: {str(e)}"
-            )
+            raise internal_server_error(e)
 
     @router.get("/graphs", dependencies=[Depends(combined_auth)])
     async def get_knowledge_graph(
@@ -219,9 +322,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         except Exception as e:
             logger.error(f"Error getting knowledge graph for label '{label}': {str(e)}")
             logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500, detail=f"Error getting knowledge graph: {str(e)}"
-            )
+            raise internal_server_error(e)
 
     @router.get("/graph/entity/exists", dependencies=[Depends(combined_auth)])
     async def check_entity_exists(
@@ -237,14 +338,17 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             Dict[str, bool]: Dictionary with 'exists' key indicating if entity exists
         """
         try:
-            exists = await rag.chunk_entity_relation_graph.has_node(name)
+            # Same resolution as the write paths, so a name POST /graph/entity/create
+            # accepted reports as existing.
+            resolved = await resolve_entity_name_for_lookup(
+                rag.chunk_entity_relation_graph, name
+            )
+            exists = await rag.chunk_entity_relation_graph.has_node(resolved)
             return {"exists": exists}
         except Exception as e:
             logger.error(f"Error checking entity existence for '{name}': {str(e)}")
             logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500, detail=f"Error checking entity existence: {str(e)}"
-            )
+            raise internal_server_error(e)
 
     @router.post("/graph/entity/edit", dependencies=[Depends(combined_auth)])
     async def update_entity(request: EntityUpdateRequest):
@@ -257,7 +361,10 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         Args:
             request (EntityUpdateRequest): Request containing:
                 - entity_name (str): Name of the entity to update
-                - updated_data (Dict[str, Any]): Dictionary of properties to update
+                - updated_data (Dict[str, Any]): Properties to update. Only
+                  entity_name (rename target), entity_type, description,
+                  source_id and file_path are accepted, each as a string; any
+                  other key or a non-string value is rejected with 400.
                 - allow_rename (bool): Whether to allow entity renaming (default: False)
                 - allow_merge (bool): Whether to merge into existing entity when renaming
                                      causes name conflict (default: False)
@@ -427,6 +534,12 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             }
         except HTTPException:
             raise
+        except PipelineReservationConflictError as gate_refusal:
+            raise _gate_refusal_to_http(gate_refusal)
+        except AdminWriteHoldExceededError as hold_exceeded:
+            raise _hold_exceeded_to_http(
+                hold_exceeded, f"updating entity '{request.entity_name}'"
+            )
         except ValueError as ve:
             logger.error(
                 f"Validation error updating entity '{request.entity_name}': {str(ve)}"
@@ -435,16 +548,21 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         except Exception as e:
             logger.error(f"Error updating entity '{request.entity_name}': {str(e)}")
             logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500, detail=f"Error updating entity: {str(e)}"
-            )
+            raise internal_server_error(e)
 
     @router.post("/graph/relation/edit", dependencies=[Depends(combined_auth)])
     async def update_relation(request: RelationUpdateRequest):
         """Update a relation's properties in the knowledge graph
 
         Args:
-            request (RelationUpdateRequest): Request containing source ID, target ID and updated data
+            request (RelationUpdateRequest): Request containing source ID,
+                target ID and updated data. Only description, keywords,
+                source_id and file_path (strings) and weight (number) are
+                accepted in updated_data; any other key or a value of the wrong
+                shape is rejected with 400. The complete updated relation must
+                keep weight at or above its distinct-source evidence count;
+                set source_id to an empty string in the same edit before
+                assigning a smaller fractional weight.
 
         Returns:
             Dict: Updated relation information
@@ -463,6 +581,16 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             }
         except HTTPException:
             raise
+        except PipelineReservationConflictError as gate_refusal:
+            raise _gate_refusal_to_http(gate_refusal)
+        except AdminWriteHoldExceededError as hold_exceeded:
+            raise _hold_exceeded_to_http(
+                hold_exceeded,
+                (
+                    f"updating relation between '{request.source_id}' and "
+                    f"'{request.target_id}'"
+                ),
+            )
         except ValueError as ve:
             logger.error(
                 f"Validation error updating relation between '{request.source_id}' and '{request.target_id}': {str(ve)}"
@@ -473,9 +601,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
                 f"Error updating relation between '{request.source_id}' and '{request.target_id}': {str(e)}"
             )
             logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500, detail=f"Error updating relation: {str(e)}"
-            )
+            raise internal_server_error(e)
 
     @router.post("/graph/entity/create", dependencies=[Depends(combined_auth)])
     async def create_entity(request: EntityCreateRequest):
@@ -533,14 +659,21 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
                 entity_name=request.entity_name,
                 entity_data=request.entity_data,
             )
+            created_entity_name = result.get("entity_name", request.entity_name)
 
             return {
                 "status": "success",
-                "message": f"Entity '{request.entity_name}' created successfully",
+                "message": f"Entity '{created_entity_name}' created successfully",
                 "data": result,
             }
         except HTTPException:
             raise
+        except PipelineReservationConflictError as gate_refusal:
+            raise _gate_refusal_to_http(gate_refusal)
+        except AdminWriteHoldExceededError as hold_exceeded:
+            raise _hold_exceeded_to_http(
+                hold_exceeded, f"creating entity '{request.entity_name}'"
+            )
         except ValueError as ve:
             logger.error(
                 f"Validation error creating entity '{request.entity_name}': {str(ve)}"
@@ -549,9 +682,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         except Exception as e:
             logger.error(f"Error creating entity '{request.entity_name}': {str(e)}")
             logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500, detail=f"Error creating entity: {str(e)}"
-            )
+            raise internal_server_error(e)
 
     @router.post("/graph/relation/create", dependencies=[Depends(combined_auth)])
     async def create_relation(request: RelationCreateRequest):
@@ -574,8 +705,11 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             relation_data (dict): Relationship properties including:
                 - description (str): Textual description of the relationship
                 - keywords (str): Comma-separated keywords describing the relationship type
-                - source_id (str): Related chunk_id from which the description originates
-                - weight (float): Relationship strength/importance (default: 1.0)
+                - source_id (str): Distinct evidence chunk IDs separated by <SEP>;
+                  omit for a source-less relation
+                - weight (float): Evidence-count floor plus an optional importance
+                  boost (default: 1.0); must be non-negative and no smaller than
+                  the number of distinct real source IDs
                 - Additional custom properties as needed
 
         Response Schema:
@@ -587,8 +721,8 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
                     "tgt_id": "Tesla",
                     "description": "Elon Musk is the CEO of Tesla",
                     "keywords": "CEO, founder",
-                    "source_id": "chunk-123<SEP>chunk-456"
-                    "weight": 1.0,
+                    "source_id": "chunk-123<SEP>chunk-456",
+                    "weight": 2.0,
                     ... (other relationship properties)
                 }
             }
@@ -606,6 +740,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
                 "relation_data": {
                     "description": "Elon Musk is the CEO of Tesla",
                     "keywords": "CEO, founder",
+                    "source_id": "chunk-123",
                     "weight": 1.0
                 }
             }
@@ -631,6 +766,16 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             }
         except HTTPException:
             raise
+        except PipelineReservationConflictError as gate_refusal:
+            raise _gate_refusal_to_http(gate_refusal)
+        except AdminWriteHoldExceededError as hold_exceeded:
+            raise _hold_exceeded_to_http(
+                hold_exceeded,
+                (
+                    f"creating relation between '{request.source_entity}' and "
+                    f"'{request.target_entity}'"
+                ),
+            )
         except ValueError as ve:
             logger.error(
                 f"Validation error creating relation between '{request.source_entity}' and '{request.target_entity}': {str(ve)}"
@@ -641,9 +786,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
                 f"Error creating relation between '{request.source_entity}' and '{request.target_entity}': {str(e)}"
             )
             logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500, detail=f"Error creating relation: {str(e)}"
-            )
+            raise internal_server_error(e)
 
     @router.post("/graph/entities/merge", dependencies=[Depends(combined_auth)])
     async def merge_entities(request: EntityMergeRequest):
@@ -687,7 +830,8 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
 
         HTTP Status Codes:
             200: Entities merged successfully
-            400: Invalid request (e.g., empty entity list, target entity doesn't exist)
+            400: Invalid request (e.g., empty entity list, source entity doesn't exist,
+                 or a name is empty after normalization)
             500: Internal server error
 
         Example Request:
@@ -698,7 +842,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             }
 
         Note:
-            - The target entity (entity_to_change_into) must exist in the knowledge graph
+            - The target entity may already exist or may be a new canonical name
             - Source entities will be permanently deleted after the merge
             - This operation cannot be undone, so verify entity names before merging
         """
@@ -708,13 +852,26 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
                 source_entities=request.entities_to_change,
                 target_entity=request.entity_to_change_into,
             )
+            merged_entity_name = result.get(
+                "entity_name", request.entity_to_change_into
+            )
             return {
                 "status": "success",
-                "message": f"Successfully merged {len(request.entities_to_change)} entities into '{request.entity_to_change_into}'",
+                "message": f"Successfully merged {len(request.entities_to_change)} entities into '{merged_entity_name}'",
                 "data": result,
             }
         except HTTPException:
             raise
+        except PipelineReservationConflictError as gate_refusal:
+            raise _gate_refusal_to_http(gate_refusal)
+        except AdminWriteHoldExceededError as hold_exceeded:
+            raise _hold_exceeded_to_http(
+                hold_exceeded,
+                (
+                    f"merging entities {request.entities_to_change} into "
+                    f"'{request.entity_to_change_into}'"
+                ),
+            )
         except ValueError as ve:
             logger.error(
                 f"Validation error merging entities {request.entities_to_change} into '{request.entity_to_change_into}': {str(ve)}"
@@ -725,9 +882,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
                 f"Error merging entities {request.entities_to_change} into '{request.entity_to_change_into}': {str(e)}"
             )
             logger.error(traceback.format_exc())
-            raise HTTPException(
-                status_code=500, detail=f"Error merging entities: {str(e)}"
-            )
+            raise internal_server_error(e)
 
     @router.delete(
         "/graph/entity/delete",
@@ -745,7 +900,8 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             DeletionResult: An object containing the outcome of the deletion process.
 
         Raises:
-            HTTPException: If the entity is not found (404) or an error occurs (500).
+            HTTPException: If the entity is not found (404), an entity name
+                cannot address any entity (400), or an error occurs (500).
         """
         try:
             await check_pipeline_busy_or_raise(rag)
@@ -753,17 +909,25 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             if result.status == "not_found":
                 raise HTTPException(status_code=404, detail=result.message)
             if result.status == "fail":
-                raise HTTPException(status_code=500, detail=result.message)
+                raise HTTPException(
+                    status_code=_failed_deletion_status(result), detail=result.message
+                )
             # Set doc_id to empty string since this is an entity operation, not document
             result.doc_id = ""
             return result
         except HTTPException:
             raise
+        except PipelineReservationConflictError as gate_refusal:
+            raise _gate_refusal_to_http(gate_refusal)
+        except AdminWriteHoldExceededError as hold_exceeded:
+            raise _hold_exceeded_to_http(
+                hold_exceeded, f"deleting entity '{request.entity_name}'"
+            )
         except Exception as e:
             error_msg = f"Error deleting entity '{request.entity_name}': {str(e)}"
             logger.error(error_msg)
             logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=error_msg)
+            raise internal_server_error(e)
 
     @router.delete(
         "/graph/relation/delete",
@@ -781,7 +945,8 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             DeletionResult: An object containing the outcome of the deletion process.
 
         Raises:
-            HTTPException: If the relation is not found (404) or an error occurs (500).
+            HTTPException: If the relation is not found (404), an entity name
+                cannot address any entity (400), or an error occurs (500).
         """
         try:
             await check_pipeline_busy_or_raise(rag)
@@ -792,16 +957,28 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             if result.status == "not_found":
                 raise HTTPException(status_code=404, detail=result.message)
             if result.status == "fail":
-                raise HTTPException(status_code=500, detail=result.message)
+                raise HTTPException(
+                    status_code=_failed_deletion_status(result), detail=result.message
+                )
             # Set doc_id to empty string since this is a relation operation, not document
             result.doc_id = ""
             return result
         except HTTPException:
             raise
+        except PipelineReservationConflictError as gate_refusal:
+            raise _gate_refusal_to_http(gate_refusal)
+        except AdminWriteHoldExceededError as hold_exceeded:
+            raise _hold_exceeded_to_http(
+                hold_exceeded,
+                (
+                    f"deleting relation from '{request.source_entity}' to "
+                    f"'{request.target_entity}'"
+                ),
+            )
         except Exception as e:
             error_msg = f"Error deleting relation from '{request.source_entity}' to '{request.target_entity}': {str(e)}"
             logger.error(error_msg)
             logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=error_msg)
+            raise internal_server_error(e)
 
     return router

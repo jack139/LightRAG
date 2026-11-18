@@ -104,7 +104,17 @@ def _new_rag(tmp_path: Path, **kwargs) -> LightRAG:
 
     return LightRAG(
         working_dir=str(tmp_path),
-        workspace=f"chunking-parity-{tmp_path.name}",
+        # The parent is in the name because every caller here passes a
+        # SUBDIRECTORY of pytest's tmp_path (`tmp_path / "work"`), so
+        # `tmp_path.name` alone is "work" for most tests in this file and they
+        # would all share one workspace. That matters because the two stores
+        # this collides across do not have the same lifetime: JsonKVStorage
+        # keeps its data in a process-wide `Manager().dict()` keyed by
+        # workspace, while NanoVectorDBStorage writes files under working_dir.
+        # One test's text chunks therefore survive into the next test's fresh,
+        # empty chunk vectors -- a shape no deployment produces, and one the
+        # startup gate correctly refuses.
+        workspace=f"chunking-parity-{tmp_path.parent.name}-{tmp_path.name}",
         llm_model_func=_mock_llm,
         embedding_func=EmbeddingFunc(
             embedding_dim=32,
@@ -444,6 +454,60 @@ class _ListHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         self.records.append(record)
+
+
+@pytest.mark.offline
+@pytest.mark.parametrize("use_custom_chunker", [False, True])
+def test_explicit_selector_reports_custom_chunking_func_bypass(
+    tmp_path, use_custom_chunker
+):
+    """An explicit selector warns only when it bypasses a customization."""
+
+    custom_calls = 0
+
+    def _custom_chunker(*args, **kwargs):
+        nonlocal custom_calls
+        custom_calls += 1
+        return [{"tokens": 1, "content": "custom", "chunk_order_index": 0}]
+
+    async def _run():
+        kwargs = {"chunking_func": _custom_chunker} if use_custom_chunker else {}
+        rag = _new_rag(tmp_path, **kwargs)
+        await rag.initialize_storages()
+
+        lightrag_logger = logging.getLogger("lightrag")
+        list_handler = _ListHandler()
+        list_handler.setLevel(logging.WARNING)
+        lightrag_logger.addHandler(list_handler)
+        doc_id = f"doc-bypass-{'custom' if use_custom_chunker else 'builtin'}"
+        try:
+            await rag.apipeline_enqueue_documents(
+                "Body for explicit fixed-token chunking.",
+                ids=[doc_id],
+                file_paths=f"{doc_id}.txt",
+                track_id=f"track-{doc_id}",
+                process_options="F",
+            )
+            await rag.apipeline_process_enqueue_documents()
+        finally:
+            lightrag_logger.removeHandler(list_handler)
+            await rag.finalize_storages()
+
+        warnings = [
+            record.getMessage()
+            for record in list_handler.records
+            if record.levelno == logging.WARNING
+            and "Custom chunking_func bypassed" in record.getMessage()
+        ]
+        if use_custom_chunker:
+            assert custom_calls == 0
+            assert len(warnings) == 1
+            assert "strategy F" in warnings[0]
+            assert doc_id in warnings[0]
+        else:
+            assert warnings == []
+
+    asyncio.run(_run())
 
 
 @pytest.mark.offline

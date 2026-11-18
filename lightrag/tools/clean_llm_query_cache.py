@@ -2,7 +2,7 @@
 """
 LLM Query Cache Cleanup Tool for LightRAG
 
-This tool cleans up LLM query cache (mix:*, hybrid:*, local:*, global:*)
+This tool cleans up LLM query cache (mix:*, hybrid:*, local:*, global:*, naive:*)
 from KV storage implementations while preserving workspace isolation.
 
 Usage:
@@ -31,6 +31,7 @@ sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
+from lightrag.constants import DEFAULT_WORKING_DIR
 from lightrag.kg import STORAGE_ENV_REQUIREMENTS
 from lightrag.kg.shared_storage import set_all_update_flags
 from lightrag.namespace import NameSpace
@@ -59,8 +60,10 @@ WORKSPACE_ENV_MAP = {
     "OpenSearchKVStorage": "OPENSEARCH_WORKSPACE",
 }
 
-# Query cache modes
-QUERY_MODES = ["mix", "hybrid", "local", "global"]
+# Query cache modes. Must cover every QueryParam.mode that reaches the LLM cache,
+# i.e. all of them except "bypass", which answers straight from the LLM and writes
+# no cache entry. Entries for a mode missing here are neither counted nor deleted.
+QUERY_MODES = ["mix", "hybrid", "local", "global", "naive"]
 
 # Query cache types
 CACHE_TYPES = ["query", "keywords"]
@@ -263,7 +266,7 @@ class CleanupTool:
 
         # Create global config
         global_config = {
-            "working_dir": os.getenv("WORKING_DIR", "./rag_storage"),
+            "working_dir": os.getenv("WORKING_DIR", DEFAULT_WORKING_DIR),
             "embedding_batch_num": 10,
         }
 
