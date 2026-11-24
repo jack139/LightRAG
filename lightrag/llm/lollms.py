@@ -16,20 +16,16 @@ from tenacity import (
     retry,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception_type,
-)
-
-from lightrag.exceptions import (
-    APIConnectionError,
-    RateLimitError,
-    APITimeoutError,
+    retry_if_exception,
 )
 
 from typing import Any, List, Union
 import numpy as np
 
+from lightrag.llm._aiohttp_retry import is_transient_aiohttp_error
 from lightrag.llm_roles import apply_llm_timeout
 from lightrag.utils import (
+    embedding_timeout,
     provider_timeout,
     wrap_embedding_func_with_attrs,
 )
@@ -38,9 +34,10 @@ from lightrag.utils import (
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10),
-    retry=retry_if_exception_type(
-        (RateLimitError, APIConnectionError, APITimeoutError)
-    ),
+    retry=retry_if_exception(is_transient_aiohttp_error),
+    # Surface the last attempt's own exception rather than tenacity.RetryError,
+    # so the document's error_msg carries the transport error's message.
+    reraise=True,
 )
 async def lollms_model_if_cache(
     model,
@@ -72,6 +69,14 @@ async def lollms_model_if_cache(
       ``max_tokens`` alias) may therefore be cached as if complete, and
       replayed unchanged from the cache even after the caller raises the
       token budget.
+
+    Retry note:
+    - A non-streaming request is retried up to three times on the failures
+      ``is_transient_aiohttp_error`` classifies as transient (connection
+      failures, timeouts, truncated bodies, transient HTTP statuses); any
+      other error fails on the first attempt.
+    - A streaming request is not retried: its connection is opened only when
+      the caller starts iterating, after this function has returned.
     """
     if image_inputs:
         raise NotImplementedError(
@@ -142,7 +147,10 @@ async def lollms_model_if_cache(
     # <= 0 or unset keeps aiohttp's session default; ClientTimeout(total=None)
     # would mean "no timeout at all".
     timeout = provider_timeout(kwargs.get("timeout"))
-    session_kwargs: dict = {"headers": headers}
+    # Raise ClientResponseError on a non-2xx status before the body is read,
+    # so an error page never becomes model output; the retry predicate above
+    # then classifies its status.
+    session_kwargs: dict = {"headers": headers, "raise_for_status": True}
     if timeout is not None:
         session_kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
 
@@ -214,7 +222,11 @@ async def lollms_embed(
         texts: List of strings to embed
         embed_model: Model name (not used directly as lollms uses configured vectorizer)
         base_url: URL of the lollms server
-        **kwargs: Additional arguments passed to the request
+        **kwargs: Additional arguments passed to the request. A ``timeout``
+            (seconds) here is the session's total timeout; without one,
+            LightRAG's ``default_embedding_timeout`` applies inside a LightRAG
+            embedding call. 0 or a negative value, or no timeout outside one,
+            keeps aiohttp's session default (300 s).
 
     Returns:
         np.ndarray: Array of embeddings
@@ -225,7 +237,12 @@ async def lollms_embed(
         if api_key
         else {"Content-Type": "application/json"}
     )
-    async with aiohttp.ClientSession(headers=headers) as session:
+    # Fail on a non-2xx status before parsing the body as an embedding.
+    session_kwargs: dict[str, Any] = {"headers": headers, "raise_for_status": True}
+    timeout = embedding_timeout(kwargs.pop("timeout", None))
+    if timeout is not None:
+        session_kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
+    async with aiohttp.ClientSession(**session_kwargs) as session:
         embeddings = []
         for text in texts:
             request_data = {"text": text}

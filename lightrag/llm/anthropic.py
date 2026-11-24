@@ -21,8 +21,11 @@ from anthropic import (
     RateLimitError,
     APITimeoutError,
 )
+from lightrag.exceptions import EmptyTruncatedResponseError
 from lightrag.llm_roles import apply_llm_timeout
 from lightrag.utils import (
+    empty_length_truncated_hint,
+    format_response_diagnostics,
     provider_timeout,
     safe_unicode_decode,
     logger,
@@ -32,7 +35,13 @@ from lightrag.api import __api_version__
 
 
 class InvalidResponseError(Exception):
-    """Kept for import compatibility; this binding never raises it."""
+    """A non-streaming response with no text content block.
+
+    A response with no text block that hit the output or context token limit
+    raises ``EmptyTruncatedResponseError`` instead. Nothing retries this error:
+    the SDK is this binding's only retry layer and does not retry a successful
+    response.
+    """
 
     pass
 
@@ -79,6 +88,11 @@ async def anthropic_complete_if_cache(
     - When the budget is exhausted, the SDK's own exception
       (``RateLimitError``, ``APIStatusError``, ``APIConnectionError``, ...)
       propagates unchanged, never a ``tenacity.RetryError``.
+
+    Extended thinking:
+    - ``thinking={...}`` may be passed through ``kwargs`` and is forwarded to
+      the API, but its output is discarded: only ``text`` blocks (streaming:
+      text deltas) reach the caller. ``enable_cot`` has no effect.
 
     Structured output note:
     - This adapter does not support OpenAI-style ``response_format`` JSON mode.
@@ -251,9 +265,8 @@ async def anthropic_complete_if_cache(
         try:
             # Record usage before extracting content text: the API call is
             # already billed and response.usage is already populated at this
-            # point, but content[0].text raises if the first content block
-            # isn't a text block (or content is empty) -- that must not cost
-            # the tracker a real, billed call.
+            # point, but extraction raises when no content block is a text
+            # block -- that must not cost the tracker a real, billed call.
             if token_tracker and getattr(response, "usage", None):
                 usage = response.usage
                 prompt_tokens = sum(
@@ -272,8 +285,63 @@ async def anthropic_complete_if_cache(
                         "total_tokens": prompt_tokens + output_tokens,
                     }
                 )
-            content = response.content[0].text
-            if getattr(response, "stop_reason", None) == "max_tokens":
+            # When extended thinking is enabled, the content list interleaves
+            # ThinkingBlock/RedactedThinkingBlock entries with the visible
+            # answer -- [thinking, text, thinking, text] is a real shape, not
+            # just [thinking, text] -- so every text block must be joined, not
+            # just the first one found. Checked by ``.type`` rather than
+            # ``hasattr(block, "text")``: a future block type could carry an
+            # unrelated ``.text`` attribute.
+            text_blocks = [
+                block.text
+                for block in response.content
+                if getattr(block, "type", None) == "text"
+            ]
+            content = "".join(text_blocks) if text_blocks else None
+            stop_reason = getattr(response, "stop_reason", None)
+            hit_context_limit = stop_reason == "model_context_window_exceeded"
+            truncated = stop_reason == "max_tokens" or hit_context_limit
+            if content is None or (truncated and not content.strip()):
+                if truncated:
+                    # Reasoning can use the remaining budget before any visible
+                    # text is produced. Retrying the same prompt and limits
+                    # would not make more room for the answer.
+                    block_types = [
+                        getattr(block, "type", None) for block in response.content
+                    ]
+                    thinking_len = sum(
+                        len(getattr(block, "thinking", "") or "")
+                        for block in response.content
+                    )
+                    usage = getattr(response, "usage", None)
+                    diagnostics = format_response_diagnostics(
+                        stop_reason=stop_reason,
+                        output_tokens=getattr(usage, "output_tokens", None),
+                        content_block_types=block_types,
+                        thinking_len=thinking_len,
+                    )
+                    if hit_context_limit:
+                        hint = "shorten the input or use a model with a larger context window"
+                    else:
+                        # Redacted thinking spends budget despite having no
+                        # readable length.
+                        hint = empty_length_truncated_hint(
+                            "consider raising max_tokens or lowering "
+                            "thinking.budget_tokens",
+                            reasoning_consumed_budget=any(
+                                t in ("thinking", "redacted_thinking")
+                                for t in block_types
+                            ),
+                        )
+                    message = (
+                        f"Anthropic API returned no usable text ({diagnostics}): {hint}"
+                    )
+                    logger.error(message)
+                    raise EmptyTruncatedResponseError(message)
+                raise InvalidResponseError(
+                    f"Anthropic API returned no text content block (stop_reason={stop_reason})"
+                )
+            if truncated:
                 content = TruncatedResponse(content)
             return content
         finally:

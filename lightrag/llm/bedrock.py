@@ -25,6 +25,7 @@ from typing import Any, Union
 
 from lightrag.llm_roles import apply_llm_timeout
 from lightrag.utils import (
+    embedding_timeout,
     provider_timeout,
     TruncatedResponse,
     empty_length_truncated_hint,
@@ -194,6 +195,8 @@ def _handle_bedrock_exception(e: Exception, operation: str = "Bedrock API") -> N
         | retry_if_exception_type(BedrockConnectionError)
         | retry_if_exception_type(BedrockTimeoutError)
     ),
+    # Surface the last attempt's own exception rather than tenacity.RetryError.
+    reraise=True,
 )
 async def bedrock_complete_if_cache(
     model,
@@ -455,17 +458,16 @@ async def bedrock_complete_if_cache(
             ):
                 raise BedrockError("Invalid response structure from Bedrock API")
 
-            # When thinking/reasoning is enabled, the first content block is a
-            # `reasoningContent` block and the visible text follows in a later
-            # block. Pick the first block that carries a text payload.
-            content = next(
-                (
-                    block["text"]
-                    for block in response["output"]["message"]["content"]
-                    if isinstance(block, dict) and block.get("text")
-                ),
-                None,
-            )
+            # When thinking/reasoning is enabled, `reasoningContent` and
+            # `text` blocks can interleave as [reasoning, text, reasoning,
+            # text, ...], not just [reasoning, text], so every text block
+            # must be joined rather than returning only the first one found.
+            text_blocks = [
+                block["text"]
+                for block in response["output"]["message"]["content"]
+                if isinstance(block, dict) and block.get("text")
+            ]
+            content = "".join(text_blocks) if text_blocks else None
 
             stop_reason = response.get("stopReason")
 
@@ -574,6 +576,8 @@ async def bedrock_complete(
         | retry_if_exception_type(BedrockConnectionError)
         | retry_if_exception_type(BedrockTimeoutError)
     ),
+    # Surface the last attempt's own exception rather than tenacity.RetryError.
+    reraise=True,
 )
 async def bedrock_embed(
     texts: list[str],
@@ -586,12 +590,18 @@ async def bedrock_embed(
     endpoint_url: str | None = None,
     *,
     embedding_dim: int | None = None,
+    timeout: float | None = None,
 ) -> np.ndarray:
     """Generate embeddings with Amazon Bedrock Runtime.
 
     ``embedding_dim`` requests an output dimension for Titan V2 only.
     Titan V1 and Cohere keep their model-defined dimensions. The API server
     forwards this option when ``EMBEDDING_SEND_DIM=true``.
+
+    ``timeout`` (seconds) maps to botocore ``connect_timeout`` and
+    ``read_timeout``. None (the default) uses LightRAG's
+    ``default_embedding_timeout`` inside a LightRAG embedding call; 0 or a
+    negative value, or None outside one, keeps botocore's defaults (60 s).
 
     Authentication note:
     - Bedrock does not use LightRAG's generic ``api_key`` fields.
@@ -624,6 +634,7 @@ async def bedrock_embed(
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
             aws_session_token=aws_session_token,
+            timeout=embedding_timeout(timeout),
         ),
     ) as bedrock_async_client:
         try:

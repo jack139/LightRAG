@@ -239,7 +239,7 @@ LIGHTRAG_PARSER=pdf:legacy-R(chunk_ts=800,chunk_ol=80);*:legacy-R  # 规则
 
 | 参数 | 别名 | 适用策略 | 类型 | 含义 |
 | --- | --- | --- | --- | --- |
-| `chunk_token_size` | `chunk_ts` | F / R / V / P / C | int（≥ 1） | 各策略的块大小 |
+| `chunk_token_size` | `chunk_ts` | F / R / V / P / C | int（≥ 64） | 各策略的块大小 |
 | `chunk_overlap_token_size` | `chunk_ol` | F / R / P / C | int（≥ 0） | 块间重叠（V 无重叠） |
 | `drop_references` | `drop_rf` | P | bool | 分块前丢弃匹配的参考文献块，如 `paper.[-P(drop_rf=true)].pdf`；布尔参数可省略取值，`paper.[-P(drop_rf)].pdf` 等价于 `drop_rf=true` |
 
@@ -613,6 +613,8 @@ chunker(tokenizer, content, chunk_token_size, **strategy_kwargs)   (分块时按
 
 下面按各变量配置的策略分组。同一个槽位上，strategy 特定变量始终高于全局兜底。
 
+**最小分块大小。** 每个 `chunk_token_size` 槽位（顶层和各策略）都必须不小于 `MIN_CHUNK_TOKEN_SIZE`（64）。更小的值被视为配置错误，在它进入的地方被拒绝：`LightRAG` 实例化时的 env 与构造字段（因此服务器启动失败）、替换 `addon_params`（原配置保持生效）、入队（调用方传入的 `chunk_options=` 或嵌套修改 `addon_params`）、REST `chunking.params`、启动时的 `LIGHTRAG_PARSER` 规则，以及新上传或扫描到的文件的文件名 hint。hint 解析本身仍接受低至 1 的值，因此用旧的较小 hint 入库的文件仍能还原为规范文件名（删除和扫描去重照常能找到它），恢复该文档也不会失败。此规则之前持久化的快照在处理时不再重新校验，已入队的文档仍可重试。直接调用分块函数时只拒绝小于 1 的值。
+
 #### 全局兜底
 
 - **`CHUNK_SIZE`** —— `1200`，int。
@@ -621,6 +623,8 @@ chunker(tokenizer, content, chunk_token_size, **strategy_kwargs)   (分块时按
   overlap 兜底。只有当某策略既没有自己的 env（`CHUNK_F_OVERLAP_SIZE` / `CHUNK_R_OVERLAP_SIZE` / `CHUNK_P_OVERLAP_SIZE`）、也没有 SDK 路径的 `LightRAG(chunk_overlap_token_size=…)` 时才填入该槽位。
 
 #### F —— 定长
+
+窗口在原文的字符边界处切分（与嵌入前硬切分使用同一个 `Tokenizer.split_by_token_limit`），因此窗口永远不会切断多字节字符，chunk 内容始终是它所来自的原文。chunk 的 `tokens` 统计的是存储下来的、去掉首尾空白后的内容；由于 BPE 把空格归入其后的词，开头空格被去掉的窗口可能比 `chunk_token_size` 多出一两个 token。
 
 - **`CHUNK_F_SIZE`** —— 未设，int。
   F 自己的 `chunk_token_size`，高于顶层兜底（`CHUNK_SIZE` 与 SDK 路径的 `LightRAG(chunk_token_size=…)`）。未设时 F 沿用顶层解析结果。
@@ -673,7 +677,7 @@ chunker(tokenizer, content, chunk_token_size, **strategy_kwargs)   (分块时按
 
 上游 `SemanticChunker` 会把**整篇文档**放进一次调用——每个句子滑窗一条，因此单请求条目数 = 全文句数，总 token 约为 `(2 × CHUNK_V_BUFFER_SIZE + 1) × 全文`。没有任何 provider 绑定会在内部切分这个列表，所以由 V 自己收口：
 
-- **单请求条目数**上限为 `EMBEDDING_BATCH_NUM`。设为 `0` 或负数等于主动放弃这个上界。
+- **单请求条目数**上限为 `EMBEDDING_BATCH_NUM`。其值必须不小于 `1`：它同时也是向量库写入的批大小，设为 `0` 或负数会在启动时被拒绝。
 - **同时在途的请求数**上限为 `EMBEDDING_FUNC_MAX_ASYNC`。这个上界的作用域是**单次分块调用**，不是整个部署——跨实例并发仍由既有的 Embedding 限流器负责。任一批失败后不再发起新批。
 - **单条滑窗的 token 长度**按 Embedding 函数声明的 `max_token_size` **尽力**截断。在 API server 路径下，该值优先取 `EMBEDDING_TOKEN_LIMIT`，未设置时则取 binding 自带的默认值——所有内置 binding 都声明了这个值（openai / azure_openai / ollama / jina / bedrock / lollms 为 `8192`，voyageai 为 `32000`，gemini 为 `2048`），因此不设 `EMBEDDING_TOKEN_LIMIT` **并不会**把预算交给 `CHUNK_V_SIZE`。只有当 `EmbeddingFunc` 自身未声明上限（`max_token_size=None` 或 `0`，仅直接调用 SDK 的场景可达）时，才回退到生效的 `CHUNK_V_SIZE`。"尽力"是字面意思：截断用的是 LightRAG 的通用 tokenizer，不保证等于 Embedding 模型的 tokenizer；而 provider 还可能在此之后改写输入（OpenAI 绑定会先拼接 document prefix，再执行自己的截断）。所以 `EMBEDDING_BATCH_NUM × 上限` 只是 LightRAG tokenizer 下的逻辑上界，**不是**对服务端实际收到多少 token 的承诺；provider 自身的原生截断（若有）独立生效。
 
@@ -1075,7 +1079,7 @@ POST /documents/recovery/force_reset
 
 | 工具 | 真相源与修复对象 | 修不了 | 成本 |
 | --- | --- | --- | --- |
-| `python -m lightrag.tools.kg_integrity_repair` | 沿 graph → chunk `source_id` → `text_chunks` → `full_doc_id` 反查，重建缺失或不可用的 `full_entities` / `full_relations` 锚点行；也能给确实什么都不拥有的文档写空锚点行 | 图↔向量漂移、`doc_status` / `full_docs` 自身、custom-chunk 日志、栅栏本身 | 不调 LLM / embedder，近乎免费 |
+| `python -m lightrag.tools.kg_integrity_repair` | 沿 graph → chunk 归属（`entity_chunks` / `relation_chunks` ∪ 被截断的 `source_id`）→ `text_chunks` → `full_doc_id` 反查，重建缺失或不可用的 `full_entities` / `full_relations` 锚点行；也能给确实什么都不拥有的文档写空锚点行 | 图↔向量漂移、`doc_status` / `full_docs` 自身、custom-chunk 日志、栅栏本身 | 不调 LLM / embedder，近乎免费 |
 | `lightrag-rebuild-vdb` | drop 后按图重建 `entities_vdb` / `relationships_vdb`、按 `text_chunks` 重建 `chunks_vdb`；能清掉反向孤儿（向量里有、图里没有），这是增量修复做不到的 | 锚点行、`doc_status`、图本身的正确性、栅栏本身 | 全量重新嵌入，真金白银 |
 
 两个顺序陷阱，弄反了会把可修复的数据变成不可修复的：

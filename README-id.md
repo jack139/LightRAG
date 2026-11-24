@@ -46,9 +46,12 @@
 
 </div>
 
-<div align="center" style="margin: 30px 0;">
-  <img src="https://user-images.githubusercontent.com/74038190/212284100-561aa473-3905-4a80-b561-0d28506553ee.gif" width="800">
-</div>
+<p align="center">
+  <picture>
+    <source media="(prefers-reduced-motion: reduce)" srcset="assets/stargazers/stargazer-affiliations.png">
+    <img src="assets/stargazers/stargazer-affiliations.gif" width="900" alt="Organisasi pilihan dari 304 organisasi yang teridentifikasi dari afiliasi yang dilaporkan sendiri oleh para pemberi bintang LightRAG di GitHub pada 23 November 2026. Bintang bersifat pribadi.">
+  </picture>
+</p>
 
 <div align="center" style="margin: 30px 0;">
     <img src="./README.assets/b2aaf634151b4706892693ffb43d9093.png" width="800" alt="LightRAG Diagram">
@@ -414,12 +417,21 @@ Timeout LLM selama ekstraksi entity-relation biasanya berasal dari salah satu da
 - **Model terjebak dalam output loop.** Beberapa model (terutama model Qwen yang di-deploy secara lokal) terkadang masuk ke endless-output loop pada teks tertentu. Jika terjadi sesekali, cukup proses ulang dokumen satu kali dan masalah biasanya terselesaikan.
 - **Khusus referensi (strategi P chunking).** Saat menggunakan strategi paragraph-semantic (`P`) chunking (misalnya `LIGHTRAG_PARSER=...-iteP`), set `CHUNK_P_DROP_REFERENCES=true` untuk otomatis membuang block referensi yang cocok sebelum chunking. Ini mencegah referensi menghasilkan terlalu banyak entity dan relation bernilai rendah, salah satu penyebab umum timeout. Opsi ini juga dapat diaktifkan per file melalui filename hint `paper.[-P(drop_rf=true)].pdf`; parameter detection terkait (`CHUNK_P_REFERENCES_TAIL_N`, `CHUNK_P_REFERENCES_HEADINGS`) didokumentasikan di `env.example`.
 
+### Mengatasi Timeout Embedding
+
+Error seperti `Embedding func: Worker execution timeout after 60s` berasal dari embedding queue, yang memiliki timeout sendiri dan tidak mengikuti `LLM_TIMEOUT`:
+
+- **Timeout-nya adalah `EMBEDDING_TIMEOUT` (default `30`).** Seperti timeout LLM, execution timeout efektif adalah **dua kali** nilai yang dikonfigurasi, sehingga nilai default menampilkan `60s`. Menaikkan `LLM_TIMEOUT` tidak berpengaruh pada pemanggilan embedding.
+- **Penyebab yang umum adalah embedding service yang lambat.** Batch embedding yang sehat selesai dalam beberapa detik, sehingga menaikkan `EMBEDDING_TIMEOUT` biasanya hanya menyembunyikan masalah. Periksa embedding service terlebih dahulu.
+- **Sesuaikan concurrency dengan kemampuan service.** LightRAG mengirim hingga `EMBEDDING_FUNC_MAX_ASYNC` (default `8`) batch sekaligus. Dengan Ollama, set `OLLAMA_NUM_PARALLEL` minimal sebesar nilai itu atau turunkan `EMBEDDING_FUNC_MAX_ASYNC`, dan jaga agar model embedding tetap dimuat (`OLLAMA_KEEP_ALIVE=-1`, atau instance Ollama terpisah), karena pertukaran model dengan LLM di VRAM membuat request embedding macet.
+
 ### Konfigurasi Penting Lainnya untuk Query Dokumen
 
 Pada tahap query dokumen, Anda juga mungkin perlu menyesuaikan environment variable berikut sesuai kebutuhan:
 - **MAX_ENTITY_TOKENS / MAX_RELATION_TOKENS / MAX_TOTAL_TOKENS**: Mengontrol panjang token dari content hasil retrieval yang dikirim ke context LLM. Content hasil retrieval terdiri atas tiga bagian: `entities`, `relations`, dan `text chunks`. Panjang entity dan relation dapat dikontrol secara independen, sedangkan panjang text chunk ditentukan dengan mengurangi panjang entity dan relation dari panjang total.
 - **ENABLE_CONTENT_HEADINGS**: Mengontrol apakah section heading tempat sebuah text chunk berada dikirim ke LLM; aktif secara default, sehingga memberi context lebih kaya kepada LLM dan meningkatkan kualitas jawaban.
 - **ENABLE_LLM_CACHE**: Menentukan apakah hasil query di-cache. Aktif secara default; pertanyaan query, mode query, dan parameter model LLM yang identik akan mengembalikan hasil yang sama.
+- **KEYWORD_EXTRACTION_JSON_MODE**: Mengatur cara ekstraksi kata kunci query meminta output terstruktur dari LLM. `auto` (default) meminta `response_format={"type": "json_object"}`, dan mencoba ulang satu kali tanpa field tersebut hanya ketika provider menolak field itu sendiri; `json_object` selalu mengirimkannya, dan `none` tidak pernah mengirimkannya. Atur `json_object` atau `none` hanya jika Anda mengetahui dukungan provider Anda — server seperti LM Studio hanya menerima `json_schema`/`text` dan menjawab HTTP 400, yang sebelumnya membuat setiap query `hybrid`/`local`/`global` mengembalikan "No relevant context found".
 - **USER_PROMPT_PREFIX / USER_PROMPT_PREFIX_FILE**: Instruksi global yang ditambahkan di depan setiap `user_prompt` request (bagian "Additional Instructions" pada answer prompt), sehingga operator memiliki satu tempat untuk menyesuaikan output LLM. Nilai ini digabungkan secara verbatim, jadi akhiri nilainya sendiri dengan `\n\n`. Jika `user_prompt` request kosong, prefix itu sendiri menjadi instruksi yang dikirim ke LLM; hanya field API `disable_user_prompt_prefix` yang dapat menonaktifkannya, dan sebuah request tidak pernah dapat membaca atau menggantinya. Gunakan `USER_PROMPT_PREFIX_FILE` (nama file `.md`/`.txt` di bawah `PROMPT_DIR/user_prompt`) untuk teks panjang atau multi-paragraf, karena nilai `.env` harus tetap berada dalam satu baris.
 
 ### Entri WebUI dan Entri Bawaan
@@ -431,6 +443,8 @@ Server memasang dua entri WebUI dari satu build frontend. **`/webui`** adalah ko
 - **ENABLE_AI_CONTENT_NOTICE**: Memberi label AI-generated pada setiap jawaban yang **dihasilkan LLM** di kedua UI query (`/workspace` dan panel retrieval `/webui`); teks yang tidak ditulis model — jawaban standar saat tidak ada konteks dan output debug panel admin — tidak diberi label. Nonaktif secara default; ini hanya elemen UI dan tidak pernah masuk ke API response atau riwayat chat yang disimpan.
 
 Dua hal yang perlu diketahui sebelum mengarahkan end user ke `/workspace`. Pertama, parameter query di sana **diwarisi, tidak dapat diedit**: setiap query menggunakan pengaturan yang disimpan `/webui` di **browser yang sama** (default frontend jika belum ada yang disimpan), yang merupakan local state per browser, bukan kebijakan server-wide. Kedua, menyembunyikan UI admin adalah pemisahan UX, **bukan** batas keamanan — API tetap melakukan otorisasi untuk setiap endpoint di sisi server. Untuk perilaku lengkap entri query, lihat [LightRAG-API-Server.md](./docs/LightRAG-API-Server.md#the-workspace-query-entry).
+
+**Migrasi autentikasi WebUI:** Akses `/webui` dan `/workspace` yang terlindungi memerlukan `AUTH_ACCOUNTS` serta `TOKEN_SECRET` yang kuat dan bukan nilai bawaan. API key ditujukan untuk akses terprogram dan tidak lagi dimasukkan atau dikirim oleh WebUI. Pengguna WebUI API-key-only yang sudah ada harus mempertahankan key-nya, mengonfigurasi akun dan secret, me-restart, memuat ulang semua tab, lalu masuk. Deployment yang sepenuhnya terbuka (tanpa akun maupun API key efektif) tetap memakai alur token guest. Lihat [detail migrasi](docs/LightRAG-API-Server.md#webui-compatibility-change-account-only-protected-access).
 
 ## Menggunakan LightRAG sebagai SDK
 
@@ -581,7 +595,11 @@ Menghapus seluruh data storage dari satu workspace secara offline, persis sepert
 
 Menghapus entri LLM cache mode query (`mix:*`, `hybrid:*`, `local:*`, `global:*`, `naive:*`) sambil mempertahankan extraction cache yang mahal.
 
-**`migrate_llm_cache.py`** — `python -m lightrag.tools.migrate_llm_cache` — [README_MIGRATE_LLM_CACHE.md](./lightrag/tools/README_MIGRATE_LLM_CACHE.md)
+**`gc_llm_cache.py`** — `lightrag-gc-llm-cache [--apply]` — [README_GC_LLM_CACHE.md](./lightrag/tools/README_GC_LLM_CACHE.md)
+
+Menghapus entri cache LLM yang chunk pemiliknya sudah tidak ada dan tidak lagi dirujuk oleh chunk lain yang masih ada. Entri ini tidak terjangkau oleh penghapusan dokumen dan masih menyimpan prompt ekstraksi beserta hasilnya. Secara default alat ini hanya melaporkan. Opsi `--apply` menghapus entri hanya setelah pembacaan ketat mengonfirmasi bahwa chunk sudah tidak ada.
+
+**`migrate_llm_cache.py`** — `lightrag-migrate-llm-cache` — [README_MIGRATE_LLM_CACHE.md](./lightrag/tools/README_MIGRATE_LLM_CACHE.md)
 
 Memigrasikan cache mode default (extraction, summary, analisis multimodal, smart-heading) antar-KV storage backend dengan tetap mempertahankan isolasi workspace.
 

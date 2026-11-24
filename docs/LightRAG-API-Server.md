@@ -222,7 +222,7 @@ During startup, configurations in the `.env` file can be overridden by command-l
 
 - `--host`: Server listening address (default: 0.0.0.0)
 - `--port`: Server listening port (default: 9621)
-- `--timeout`: LLM request timeout (default: 150 seconds)
+- `--timeout`: Base of the Gunicorn worker timeout, in seconds; the worker timeout is this value + 30 (default: 150). Ignored by `lightrag-server`; LLM requests use `LLM_TIMEOUT`
 - `--log-level`: Log level (default: INFO)
 - `--working-dir`: Database persistence directory (default: ./rag_storage)
 - `--input-dir`: Directory for uploaded files (default: ./inputs)
@@ -262,7 +262,7 @@ Using Docker Compose is the most convenient way to deploy and run the LightRAG S
 
 - Create a project directory.
 - Copy the `docker-compose.yml` file from the LightRAG repository into your project directory.
-- Prepare the `.env` file: Duplicate the sample file [`env.example`](https://ai.znipower.com:5013/c/env.example)to create a customized `.env` file, and configure the LLM and embedding parameters according to your specific requirements.
+- Prepare the `.env` file: Duplicate the sample file [`env.example`](../env.example) to create a customized `.env` file, and configure the LLM and embedding parameters according to your specific requirements.
 - Start the LightRAG Server with the following command:
 
 ```shell
@@ -310,10 +310,10 @@ VLM_PROCESS_ENABLE=false
 LLM_BINDING=openai
 LLM_BINDING_HOST=https://api.openai.com/v1
 LLM_BINDING_API_KEY=your_api_key
-LLM_MODEL=gpt-5-mini
+LLM_MODEL=gpt-6.1-terra
 
-KEYWORD_LLM_MODEL=gpt-5-nano
-QUERY_LLM_MODEL=gpt-5
+KEYWORD_LLM_MODEL=gpt-6-luna
+QUERY_LLM_MODEL=gpt-6.1-sol
 
 #######################################################################################
 ### Embedding Configuration (do not change after the first file is processed)
@@ -381,7 +381,7 @@ Use this after the basic document flow works. The MinerU official API avoids run
 LIGHTRAG_PARSER=*:native-iteP,*:mineru-iteP,*:legacy-R
 
 VLM_PROCESS_ENABLE=true
-VLM_LLM_MODEL=gpt-5-mini
+VLM_LLM_MODEL=gpt-6.1-terra
 
 MINERU_API_MODE=official
 MINERU_API_TOKEN=your_mineru_api_token
@@ -697,13 +697,45 @@ Passwords without a prefix are treated as plaintext. To store a bcrypt password,
 lightrag-hash-password --username admin
 ```
 
-The command prompts for the password and prints an `admin:{bcrypt}...` entry ready to paste into `.env`.
+The command prompts for the password and prints an `admin:{bcrypt}...` entry ready to paste into `.env`. bcrypt only uses the first 72 bytes of a password, so the command refuses a longer one (UTF-8 bytes, not characters); choose a shorter password instead.
 
 > Currently, only the configuration of an administrator account and password is supported. A comprehensive account system is yet to be developed and implemented.
 
-If Account credentials are not configured, the Web UI will access the system as a Guest. Therefore, even if only an API Key is configured, all APIs can still be accessed through the Guest account, which remains insecure. Hence, to safeguard the API, it is necessary to configure both authentication methods simultaneously.
+### WebUI compatibility change: account-only protected access
 
-> Although the server can be configured with **both** an API key and account credentials, a single request should send **either** `X-API-Key` **or** `Authorization: Bearer <token>` — not both. When both headers are present, the `Authorization` token is validated first; if it is invalid or expired the request is rejected with `401 Invalid token` even when a valid `X-API-Key` is also supplied.
+Both `/webui` and `/workspace` no longer prompt for, store, or send API keys.
+API keys remain supported for programmatic API access; this transition does not
+change backend credential acceptance, dual-credential failures, or token renewal.
+
+| Accounts (`AUTH_ACCOUNTS`) | Effective API key (`LIGHTRAG_API_KEY` or `--key`) | WebUI |
+| --- | --- | --- |
+| Not configured | Not configured | Existing guest-token acquisition, transmission, refresh and renewal |
+| Configured | Not configured | Account login; user token only |
+| Configured | Configured | Account login; user token only |
+| Not configured | Configured | Configuration guidance; no guest application access or API-key prompt |
+
+**Migration for existing API-key-only WebUI users:** keep the API key, configure
+`AUTH_ACCOUNTS` and a strong, non-default `TOKEN_SECRET`, restart, reload all WebUI
+tabs, and sign in. Do not remove API-key protection to regain WebUI access.
+Deploy matching frontend/backend builds. A new WebUI cannot safely distinguish
+fully open from API-key-only on an older server without the discovery field and
+shows guidance instead of guessing guest access. Known legacy browser settings
+have only their `apiKey` removed; unrelated settings are retained. Unknown future
+storage versions remain untouched and are never used as credentials.
+
+Fully open WebUI access still uses guest tokens; a guest is not an authenticated
+account. Tokenless programmatic requests remain supported in fully open mode.
+A guest token alone does **not** bypass API-key protection on protected routes.
+The server still starts and serves programmatic clients in API-key-only mode.
+
+`GET /auth-status` adds the non-secret boolean `api_key_configured`, calculated
+from the effective server key. Existing fields, including `auth_configured`
+(account configuration only), retain their meanings; `/login` is unchanged.
+The browser uses discovery to choose its supported flow, not to enforce a new
+backend authorization policy. This migration does not change `WHITELIST_PATHS`
+handling either.
+
+> Although the server can be configured with **both** an API key and account credentials, a single programmatic request should send **either** `X-API-Key` **or** `Authorization: Bearer <token>` — not both. When both headers are present, the `Authorization` token is validated first; if it is invalid or expired the request is rejected with `401 Invalid token` even when a valid `X-API-Key` is also supplied. This WebUI migration does not change that behavior.
 
 ## For Azure OpenAI Backend
 
@@ -829,14 +861,14 @@ If a role is not configured, it inherits the base `LLM_*` settings. Minimal same
 
 ```bash
 LLM_BINDING=openai
-LLM_MODEL=gpt-5-mini
+LLM_MODEL=gpt-6.1-terra
 LLM_BINDING_HOST=https://api.openai.com/v1
 LLM_BINDING_API_KEY=your_api_key
 
-EXTRACT_LLM_MODEL=gpt-5-mini
-KEYWORD_LLM_MODEL=gpt-5-nano
-QUERY_LLM_MODEL=gpt-5
-VLM_LLM_MODEL=gpt-5-mini
+EXTRACT_LLM_MODEL=gpt-6.1-terra
+KEYWORD_LLM_MODEL=gpt-6-luna
+QUERY_LLM_MODEL=gpt-6.1-sol
+VLM_LLM_MODEL=gpt-6.1-terra
 ```
 
 **Recommended models by role:**
@@ -894,6 +926,18 @@ MAX_EXTRACTION_ENTITIES=40
 ```
 
 If an old `.env` still contains `ENTITY_TYPES`, remove it before startup. The server fails fast because this variable has been replaced by prompt profiles.
+
+### Query Keyword Extraction Configuration
+
+Keyword extraction runs on the query path (the `KEYWORD` role LLM) for the `hybrid`, `local` and `global` modes. Its structured-output policy is independent of `ENTITY_EXTRACTION_USE_JSON`:
+
+- `KEYWORD_EXTRACTION_JSON_MODE`: `auto` (default) requests `response_format={"type": "json_object"}` and retries the same prompt once without it, but only when the provider rejects that field itself; `json_object` always sends it; `none` never sends it. Set `json_object` or `none` only when you know your provider's position: servers such as LM Studio accept only `json_schema`/`text` and answer HTTP 400, which the query path surfaces as an empty retrieval result.
+
+Example:
+
+```bash
+KEYWORD_EXTRACTION_JSON_MODE=auto
+```
 
 ### Storage Types Supported
 
@@ -1024,7 +1068,7 @@ Only the graph moves; vector and KV data are untouched and stay valid, because t
 | `--port` | `9621` | Server port |
 | `--working-dir` | `./rag_storage` | Working directory for RAG storage |
 | `--input-dir` | `./inputs` | Directory containing uploaded/input documents |
-| `--timeout` | `150` | Gunicorn worker timeout and fallback request timeout |
+| `--timeout` | `150` | Base of the Gunicorn worker timeout in seconds (worker timeout = value + 30); not an LLM request timeout |
 | `--max-async` | `4` | Base maximum LLM concurrency; also the per-document chunk-extraction task limit (each entity/relation merge phase uses twice this task limit) |
 | `--log-level` | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) |
 | `--verbose` | `False` | Verbose debug output, effective with debug logging |

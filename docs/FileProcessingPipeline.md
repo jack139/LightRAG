@@ -239,7 +239,7 @@ Currently supported parameters (canonical name / short alias):
 
 | Parameter | Alias | Strategies | Type | Meaning |
 | --- | --- | --- | --- | --- |
-| `chunk_token_size` | `chunk_ts` | F / R / V / P / C | int (≥ 1) | Per-strategy chunk size |
+| `chunk_token_size` | `chunk_ts` | F / R / V / P / C | int (≥ 64) | Per-strategy chunk size |
 | `chunk_overlap_token_size` | `chunk_ol` | F / R / P / C | int (≥ 0) | Overlap between chunks (V has no overlap) |
 | `drop_references` | `drop_rf` | P | bool | Drop matching reference blocks before chunking, e.g. `paper.[-P(drop_rf=true)].pdf`. As a boolean it may be written bare: `paper.[-P(drop_rf)].pdf` means `drop_rf=true` |
 
@@ -613,6 +613,8 @@ All variables below are read into `addon_params["chunker"]` once when `LightRAG`
 
 They are grouped by the strategy they configure. A strategy-specific variable always outranks the global fallback for the same slot.
 
+**Minimum chunk size.** Every `chunk_token_size` slot, top-level and per strategy, must be at least `MIN_CHUNK_TOKEN_SIZE` (64). A smaller value is rejected as a misconfiguration wherever it enters: env and constructor fields when `LightRAG` is instantiated (so the server fails at startup), an `addon_params` replacement (the previous configuration stays in force), enqueue (caller-supplied `chunk_options=` or a nested `addon_params` edit), REST `chunking.params`, `LIGHTRAG_PARSER` rules at startup, and the filename hint of a new upload or scanned file. Hint parsing itself still accepts sizes down to 1, so a file ingested with an older, smaller hint keeps its canonical name (deletion and scan dedup still find it), and resuming that document does not fail. A snapshot persisted before this rule is not re-checked when it is processed, so an already enqueued document stays retryable. The chunker functions called directly only reject sizes below 1.
+
 #### Global fallbacks
 
 - **`CHUNK_SIZE`** — `1200`, int.
@@ -621,6 +623,8 @@ They are grouped by the strategy they configure. A strategy-specific variable al
   Overlap fallback. Fills a slot only when the strategy has neither its own env (`CHUNK_F_OVERLAP_SIZE` / `CHUNK_R_OVERLAP_SIZE` / `CHUNK_P_OVERLAP_SIZE`) nor the SDK path's `LightRAG(chunk_overlap_token_size=…)`.
 
 #### F — fixed length
+
+Windows are cut at character boundaries of the source (the same `Tokenizer.split_by_token_limit` the pre-embedding hard split uses), so a window never splits a multi-byte character and a chunk's content is always the source text it came from. A chunk's `tokens` counts its stored, whitespace-stripped content; because BPE attaches a space to the following word, a window whose leading space is stripped can count a token or two above `chunk_token_size`.
 
 - **`CHUNK_F_SIZE`** — unset, int.
   F's own `chunk_token_size`, outranking the top-level fallback (`CHUNK_SIZE` and the SDK path's `LightRAG(chunk_token_size=…)`). When unset, F inherits the top-level resolved value.
@@ -673,7 +677,7 @@ They are grouped by the strategy they configure. A strategy-specific variable al
 
 Upstream `SemanticChunker` embeds the **whole document** in a single call — one item per sentence window, so a request carries `N = sentence count` items and roughly `(2 x CHUNK_V_BUFFER_SIZE + 1) x document` tokens. No provider binding slices that list, so V bounds it itself:
 
-- **Items per request** are capped at `EMBEDDING_BATCH_NUM`. Set it to `0` or below only if you want to give up the bound entirely.
+- **Items per request** are capped at `EMBEDDING_BATCH_NUM`. It must be `1` or more: the same value is the vector-store flush batch size, so `0` or a negative value is refused at startup.
 - **Requests in flight** from one chunker call are capped at `EMBEDDING_FUNC_MAX_ASYNC`. This bounds a single call, not the deployment — cross-instance concurrency stays with the usual embedding limiter. Once one batch fails, no further batch is started.
 - **Per-window token length** is truncated on a **best-effort** basis to the embedding function's declared `max_token_size`. On the API server path that is `EMBEDDING_TOKEN_LIMIT` when set, and otherwise the binding's own default — every built-in binding declares one (`8192` for openai / azure_openai / ollama / jina / bedrock / lollms, `32000` for voyageai, `2048` for gemini), so leaving `EMBEDDING_TOKEN_LIMIT` unset does **not** hand the budget to `CHUNK_V_SIZE`. The effective `CHUNK_V_SIZE` is the fallback only when the `EmbeddingFunc` itself declares no limit — `max_token_size=None` or `0`, reachable from a direct SDK caller. "Best effort" is literal: the truncation uses LightRAG's general-purpose tokenizer, which need not be the embedding model's, and providers may rewrite the input afterwards (the OpenAI binding prepends its document prefix before running its own truncation). So `EMBEDDING_BATCH_NUM x limit` is a logical bound under LightRAG's tokenizer, never a promise about what the service receives; the provider's own native truncation, if any, applies independently.
 
@@ -1075,7 +1079,7 @@ What each offline tool can and cannot repair:
 
 | Tool | Source of truth and what it repairs | What it cannot repair | Cost |
 | --- | --- | --- | --- |
-| `python -m lightrag.tools.kg_integrity_repair` | Walks graph → chunk `source_id` → `text_chunks` → `full_doc_id` to rebuild missing or unusable `full_entities` / `full_relations` anchor rows; can also write empty anchor rows for a document that genuinely owns nothing | Graph↔VDB drift, `doc_status` / `full_docs` themselves, custom-chunk journals, the fence itself | Never calls the LLM or embedder — effectively free |
+| `python -m lightrag.tools.kg_integrity_repair` | Walks graph → chunk provenance (`entity_chunks` / `relation_chunks` ∪ capped `source_id`) → `text_chunks` → `full_doc_id` to rebuild missing or unusable `full_entities` / `full_relations` anchor rows; can also write empty anchor rows for a document that genuinely owns nothing | Graph↔VDB drift, `doc_status` / `full_docs` themselves, custom-chunk journals, the fence itself | Never calls the LLM or embedder — effectively free |
 | `lightrag-rebuild-vdb` | Drops and rebuilds `entities_vdb` / `relationships_vdb` from the graph and `chunks_vdb` from `text_chunks`; also clears reverse orphans (present in the vector store, absent from the graph), which incremental repair cannot do | Anchor rows, `doc_status`, the correctness of the graph itself, the fence itself | A full re-embed — real money |
 
 Two ordering traps; getting them backwards turns repairable data into unrepairable data:
